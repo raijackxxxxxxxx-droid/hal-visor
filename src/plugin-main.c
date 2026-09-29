@@ -1,34 +1,56 @@
-/*
-Plugin Name
-Copyright (C) <Year> <Developer> <Email Address>
-
-This program is free software; you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation; either version 2 of the License, or
-(at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License along
-with this program. If not, see <https://www.gnu.org/licenses/>
-*/
-
 #include <obs-module.h>
-#include <plugin-support.h>
 
 OBS_DECLARE_MODULE()
-OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
+OBS_MODULE_USE_DEFAULT_LOCALE("hal-visor", "en-US")
 
-bool obs_module_load(void)
+// フィルタの名前（OBSのフィルタ一覧に表示される名前）
+static const char *hal_visor_get_name(void *unused)
 {
-	obs_log(LOG_INFO, "plugin loaded successfully (version %s)", PLUGIN_VERSION);
-	return true;
+    UNUSED_PARAMETER(unused);
+    return "HaL Visor (Alpha)";
 }
 
-void obs_module_unload(void)
+// フィルタ破棄時のメモリ解放
+static void hal_visor_destroy(void *data)
 {
-	obs_log(LOG_INFO, "plugin unloaded");
+    bfree(data);
+}
+
+// フィルタ追加時に呼ばれる初期化
+static void *hal_visor_create(obs_data_t *settings, obs_source_t *source)
+{
+    UNUSED_PARAMETER(settings);
+    UNUSED_PARAMETER(source);
+    
+    // 最小限のデータを確保
+    void *data = bzalloc(sizeof(int));
+    return data;
+}
+
+// 映像描画処理（まずは映像を素通しするだけ）
+static void hal_visor_video_render(void *data, gs_effect_t *effect)
+{
+    UNUSED_PARAMETER(data);
+    UNUSED_PARAMETER(effect);
+
+    // フィルタをスキップして元の映像をそのまま通す
+    obs_source_skip_video_filter((obs_source_t*)data);
+}
+
+// OBSに教えるフィルタの基本設計図
+struct obs_source_info hal_visor_filter_info = {
+    .id = "hal_visor_filter",
+    .type = OBS_SOURCE_TYPE_FILTER,
+    .output_flags = OBS_SOURCE_VIDEO,
+    .get_name = hal_visor_get_name,
+    .create = hal_visor_create,
+    .destroy = hal_visor_destroy,
+    .video_render = hal_visor_video_render,
+};
+
+// OBS起動時にプラグインを読み込む
+bool obs_module_load(void)
+{
+    obs_register_source(&hal_visor_filter_info);
+    return true;
 }
