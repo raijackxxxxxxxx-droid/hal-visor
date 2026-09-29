@@ -3,8 +3,6 @@ name: Build for Windows
 on:
   push:
     branches: [ "master", "main" ]
-  pull_request:
-    branches: [ "master", "main" ]
 
 jobs:
   build-windows:
@@ -17,12 +15,9 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Setup Ninja
-        uses: ashutoshvarma/setup-ninja@master
-
       - name: Configure CMake
         run: |
-          cmake -B build -S . -G "Ninja" -DCMAKE_BUILD_TYPE=Release
+          cmake -B build -S . -G "Visual Studio 17 2022" -A x64
 
       - name: Build
         run: |
