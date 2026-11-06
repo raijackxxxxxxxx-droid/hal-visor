@@ -6,6 +6,8 @@
 
 #include <obs-module.h>
 #include <graphics/image-file.h>
+#include <graphics/vec2.h>
+#include <graphics/vec3.h>
 #include <util/platform.h>
 
 #include <math.h>
@@ -74,6 +76,10 @@ struct hal_visor_data {
 
 	struct hal_face_detector *detector;
 	bool detector_tried;
+	/* ステップ4: 変形描画用の頂点バッファ
+	 * (GS_DUP_BUFFER なので vbd の所有権はフィルター側に残る) */
+	gs_vertbuffer_t *quad_vb;
+	struct gs_vb_data *quad_vbd;
 	gs_texrender_t *capture;
 	gs_stagesurf_t *stage;
 	uint32_t stage_w;
@@ -437,7 +443,16 @@ static void hal_visor_destroy(void *data)
 	obs_enter_graphics();
 	gs_image_file_free(&filter->image);
 	free_capture(filter);
+	if (filter->quad_vb) {
+		gs_vertexbuffer_destroy(filter->quad_vb);
+		filter->quad_vb = NULL;
+	}
 	obs_leave_graphics();
+
+	if (filter->quad_vbd) {
+		gs_vbdata_destroy(filter->quad_vbd);
+		filter->quad_vbd = NULL;
+	}
 
 	hal_face_detector_destroy(filter->detector);
 	bfree(filter->frame.buf);
@@ -536,6 +551,149 @@ static void draw_visor_image(struct hal_visor_data *filter, float center_x,
 	gs_blend_state_pop();
 }
 
+/*
+ * 変形描画用の頂点バッファを用意する (描画文脈で呼ぶ)。
+ * 4頂点 (位置 + UV) を GS_DUP_BUFFER | GS_DYNAMIC で作り、毎フレーム
+ * gs_vertexbuffer_get_data で位置だけ書き換える (libobs の subregion と同方式)。
+ */
+static bool ensure_quad_vb(struct hal_visor_data *filter)
+{
+	if (filter->quad_vb)
+		return true;
+
+	struct gs_vb_data *vbd = gs_vbdata_create();
+	vbd->num = 4;
+	vbd->points = bzalloc(sizeof(struct vec3) * 4);
+	vbd->num_tex = 1;
+	vbd->tvarray = bzalloc(sizeof(struct gs_tvertarray));
+	vbd->tvarray[0].width = 2;
+	vbd->tvarray[0].array = bzalloc(sizeof(struct vec2) * 4);
+
+	/* UV は gs_draw_sprite (反転なし) と同じ割り当て: TL, TR, BL, BR */
+	struct vec2 *uvs = vbd->tvarray[0].array;
+	uvs[1].x = 1.0f;
+	uvs[2].y = 1.0f;
+	uvs[3].x = 1.0f;
+	uvs[3].y = 1.0f;
+
+	filter->quad_vb =
+		gs_vertexbuffer_create(vbd, GS_DUP_BUFFER | GS_DYNAMIC);
+	if (!filter->quad_vb) {
+		gs_vbdata_destroy(vbd);
+		return false;
+	}
+	filter->quad_vbd = vbd;
+	return true;
+}
+
+/*
+ * バイザーを顔の向き (yaw/pitch) に合わせて変形して描く。
+ * ローカルの隅 (±w/2, ±h/2, 0) を Y軸まわり (yaw) → X軸まわり (pitch) の
+ * 順に回し、焦点距離 f = 4w の弱い透視で投影した四角形を描く。
+ * 座標系は estimate_angles と同じ (x: 右目→左目、y: 下、z: カメラ向きが正)。
+ *   yaw 回転:   x1 = x・cos(yaw),        z1 = -x・sin(yaw)
+ *   pitch 回転: y2 = y・cos(pitch) + z1・sin(pitch),
+ *               z2 = -y・sin(pitch) + z1・cos(pitch)
+ *   投影: s = f / (f - z2) (手前ほど大きい)
+ * 目の線の回転と目の中心への移動は、スプライト描画と同じ行列で行う。
+ * 頂点の順序と UV は gs_draw_sprite (反転なし) と同一: TL, TR, BL, BR。
+ */
+static bool draw_visor_warped(struct hal_visor_data *filter, float center_x,
+			      float center_y, float w, float h,
+			      float roll_rad, float yaw, float pitch)
+{
+	if (w <= 0.0f || h <= 0.0f || !ensure_quad_vb(filter))
+		return false;
+
+	const float lx[4] = {-0.5f, 0.5f, -0.5f, 0.5f}; /* TL, TR, BL, BR */
+	const float ly[4] = {-0.5f, -0.5f, 0.5f, 0.5f};
+	const float cyw = cosf(yaw), syw = sinf(yaw);
+	const float cpt = cosf(pitch), spt = sinf(pitch);
+	const float f = 4.0f * w;
+	float px[4], py[4];
+	float min_x = 0.0f, max_x = 0.0f, min_y = 0.0f, max_y = 0.0f;
+
+	for (int i = 0; i < 4; i++) {
+		float x = lx[i] * w;
+		float y = ly[i] * h;
+		float x1 = x * cyw;
+		float z1 = -x * syw;
+		float y2 = y * cpt + z1 * spt;
+		float z2 = -y * spt + z1 * cpt;
+		float s = f / (f - z2);
+		px[i] = x1 * s;
+		py[i] = y2 * s;
+		if (i == 0) {
+			min_x = max_x = px[i];
+			min_y = max_y = py[i];
+		} else {
+			if (px[i] < min_x)
+				min_x = px[i];
+			if (px[i] > max_x)
+				max_x = px[i];
+			if (py[i] < min_y)
+				min_y = py[i];
+			if (py[i] > max_y)
+				max_y = py[i];
+		}
+	}
+
+	/* 退化ガード: 投影後の幅・高さが元の2割未満なら重心まわりに広げる */
+	float pw = max_x - min_x, ph = max_y - min_y;
+	float pcx = (min_x + max_x) * 0.5f, pcy = (min_y + max_y) * 0.5f;
+	if (pw < 0.2f * w) {
+		if (pw > 1e-6f) {
+			float k = (0.2f * w) / pw;
+			for (int i = 0; i < 4; i++)
+				px[i] = pcx + (px[i] - pcx) * k;
+		} else {
+			for (int i = 0; i < 4; i++)
+				px[i] = pcx + lx[i] * 0.2f * w;
+		}
+	}
+	if (ph < 0.2f * h) {
+		if (ph > 1e-6f) {
+			float k = (0.2f * h) / ph;
+			for (int i = 0; i < 4; i++)
+				py[i] = pcy + (py[i] - pcy) * k;
+		} else {
+			for (int i = 0; i < 4; i++)
+				py[i] = pcy + ly[i] * 0.2f * h;
+		}
+	}
+
+	struct gs_vb_data *data = gs_vertexbuffer_get_data(filter->quad_vb);
+	if (!data)
+		return false;
+	for (int i = 0; i < 4; i++)
+		vec3_set(data->points + i, px[i], py[i], 0.0f);
+	gs_vertexbuffer_flush(filter->quad_vb);
+
+	gs_effect_t *draw_effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+	gs_eparam_t *image_param =
+		gs_effect_get_param_by_name(draw_effect, "image");
+	gs_effect_set_texture(image_param, filter->image.texture);
+
+	gs_blend_state_push();
+	gs_enable_color(true, true, true, true);
+	gs_blend_function(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA);
+
+	gs_matrix_push();
+	gs_matrix_translate3f(center_x, center_y, 0.0f);
+	if (roll_rad != 0.0f)
+		gs_matrix_rotaa4f(0.0f, 0.0f, 1.0f, roll_rad);
+
+	gs_load_vertexbuffer(filter->quad_vb);
+	gs_load_indexbuffer(NULL);
+	while (gs_effect_loop(draw_effect, "Draw")) {
+		gs_draw(GS_TRISTRIP, 0, 0);
+	}
+
+	gs_matrix_pop();
+	gs_blend_state_pop();
+	return true;
+}
+
 static void hal_visor_video_render(void *data, gs_effect_t *effect)
 {
 	struct hal_visor_data *filter = data;
@@ -631,12 +789,29 @@ static void hal_visor_video_render(void *data, gs_effect_t *effect)
 		    filter->sm_dist > 0.0f) {
 			// 追従: 平滑化済みの目位置・間隔・角度で1回だけ描く。
 			// 検出が途切れても最後の変換を保持する (隠し続ける)。
-			float ts = (float)((double)filter->sm_dist *
-					   filter->width_factor) /
-				   (float)filter->image.cx;
 			float ang = atan2f(filter->sm_sin, filter->sm_cos);
-			draw_visor_image(filter, filter->sm_x, filter->sm_y,
-					 ts, ang);
+			bool drawn = false;
+			if (filter->calib_valid && filter->deform > 0) {
+				// 正面登録があれば、顔の向きで変形して描く
+				float yaw = 0.0f, pitch = 0.0f;
+				estimate_angles(filter,
+						(float)filter->deform / 100.0f,
+						&yaw, &pitch);
+				float w = (float)((double)filter->sm_dist *
+						  filter->width_factor);
+				float h = w * (float)filter->image.cy /
+					  (float)filter->image.cx;
+				drawn = draw_visor_warped(filter, filter->sm_x,
+							  filter->sm_y, w, h,
+							  ang, yaw, pitch);
+			}
+			if (!drawn) {
+				float ts = (float)((double)filter->sm_dist *
+						   filter->width_factor) /
+					   (float)filter->image.cx;
+				draw_visor_image(filter, filter->sm_x,
+						 filter->sm_y, ts, ang);
+			}
 		} else {
 			// 従来のスライダー位置
 			float s = (float)filter->scale / 100.0f;
