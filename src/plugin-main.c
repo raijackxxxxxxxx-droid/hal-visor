@@ -22,7 +22,7 @@ int scale;
 struct hal_face_detector *detector;
 bool detector_tried;
 gs_texrender_t *capture;
-gs_stagesurface_t *stage;
+gs_stagesurf_t *stage;
 uint32_t stage_w;
 uint32_t stage_h;
 bool stage_pending;

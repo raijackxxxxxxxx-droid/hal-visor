@@ -71,7 +71,8 @@ struct hal_face_detector *hal_face_detector_create(const char *model_path)
 
 #ifdef _WIN32
 	{
-		wchar_t *wpath = os_utf8_to_wcs_ptr(model_path);
+		wchar_t *wpath = NULL;
+		os_utf8_to_wcs_ptr(model_path, 0, &wpath);
 		st = api->CreateSession(d->env, wpath, opts, &d->session);
 		bfree(wpath);
 	}
