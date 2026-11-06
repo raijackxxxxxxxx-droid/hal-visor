@@ -1,6 +1,15 @@
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 #include <obs-module.h>
 #include <graphics/image-file.h>
 #include <util/platform.h>
+
+#include <math.h>
+#include <string.h>
 
 #include "face-detect.h"
 
@@ -10,333 +19,682 @@ OBS_MODULE_USE_DEFAULT_LOCALE("hal-visor", "en-US")
 /* obs_module_load 時 (モジュール文脈が確実な場所) でモデルパスを解決しておく */
 static char *g_model_path = NULL;
 
-struct hal_visor_data {
-obs_source_t *source;
-gs_image_file_t image;
-char *image_path;
-int pos_x;
-int pos_y;
-int scale;
+/* 検出結果が「新鮮」と言える上限 (ns) と、平滑化の係数 */
+#define HAL_FRESH_NS 500000000ULL
+#define HAL_SMOOTH 0.35f
 
-/* ステップ2: 顔検出の配管確認 */
-struct hal_face_detector *detector;
-bool detector_tried;
-gs_texrender_t *capture;
-gs_stagesurf_t *stage;
-uint32_t stage_w;
-uint32_t stage_h;
-bool stage_pending;
-uint32_t frame_count;
-struct hal_face_result face;
-uint64_t last_log_ns;
+/* 描画スレッド → ワーカー へのフレーム受け渡しスロット (lock で保護) */
+struct hv_frame_slot {
+	float *buf;
+	int in_w;
+	int in_h;
+	int src_w;
+	int src_h;
+	bool pending;
+	uint64_t seq;
+};
+
+/* ワーカー → 描画スレッド への結果スロット (lock で保護) */
+struct hv_result_slot {
+	struct hal_face_result res;
+	uint64_t seq;
+	uint64_t time_ns;
+	bool valid;
+};
+
+struct hal_visor_data {
+	obs_source_t *source;
+	gs_image_file_t image;
+	char *image_path;
+	int pos_x;
+	int pos_y;
+	int scale;
+
+	/* ステップ3: 追従の設定 */
+	bool tracking;
+	double width_factor;
+	/* 正面登録 (フィルター設定に永続化される) */
+	bool calib_valid;
+	double calib_eye_dist;
+	double calib_nose_nx;
+	double calib_nose_ny;
+
+	struct hal_face_detector *detector;
+	bool detector_tried;
+	gs_texrender_t *capture;
+	gs_stagesurf_t *stage;
+	uint32_t stage_w;
+	uint32_t stage_h;
+	bool stage_pending;
+	uint32_t frame_count;
+	uint64_t last_log_ns;
+
+	/* ワーカースレッドと受け渡しスロット */
+	struct hv_frame_slot frame;
+	struct hv_result_slot result;
+	float *worker_buf;
+	bool worker_started;
+	bool worker_stop;
+#ifdef _WIN32
+	CRITICAL_SECTION lock;
+	HANDLE frame_event;
+	HANDLE worker_thread;
+#endif
+
+	/* 平滑化済みの追従状態 (描画スレッド専用) */
+	bool have_track;
+	bool track_lost;
+	float sm_x;
+	float sm_y;
+	float sm_dist;
+	float sm_cos;
+	float sm_sin;
+	uint64_t applied_seq;
 };
 
 static const char *hal_visor_get_name(void *unused)
 {
-UNUSED_PARAMETER(unused);
-return "HaL Visor";
+	UNUSED_PARAMETER(unused);
+	return "HaL Visor";
+}
+
+static void hv_lock(struct hal_visor_data *filter)
+{
+#ifdef _WIN32
+	EnterCriticalSection(&filter->lock);
+#else
+	UNUSED_PARAMETER(filter);
+#endif
+}
+
+static void hv_unlock(struct hal_visor_data *filter)
+{
+#ifdef _WIN32
+	LeaveCriticalSection(&filter->lock);
+#else
+	UNUSED_PARAMETER(filter);
+#endif
+}
+
+/* ---- ワーカースレッド: スロットのフレームを取り出して推論し、結果を返す ---- */
+#ifdef _WIN32
+static DWORD WINAPI hal_worker_proc(LPVOID param)
+{
+	struct hal_visor_data *filter = param;
+
+	for (;;) {
+		WaitForSingleObject(filter->frame_event, INFINITE);
+
+		struct hal_face_detector *det = NULL;
+		int in_w = 0, in_h = 0, src_w = 0, src_h = 0;
+		bool stop = false;
+
+		EnterCriticalSection(&filter->lock);
+		if (filter->worker_stop) {
+			stop = true;
+		} else if (filter->frame.pending) {
+			size_t n = (size_t)filter->frame.in_w *
+				   filter->frame.in_h * 3;
+			memcpy(filter->worker_buf, filter->frame.buf,
+			       n * sizeof(float));
+			in_w = filter->frame.in_w;
+			in_h = filter->frame.in_h;
+			src_w = filter->frame.src_w;
+			src_h = filter->frame.src_h;
+			det = filter->detector;
+			filter->frame.pending = false;
+		}
+		LeaveCriticalSection(&filter->lock);
+
+		if (stop)
+			break;
+		if (!det || in_w <= 0 || in_h <= 0)
+			continue;
+
+		struct hal_face_result res;
+		memset(&res, 0, sizeof(res));
+		hal_face_detector_infer(det, filter->worker_buf, in_w, in_h,
+					src_w, src_h, &res);
+
+		EnterCriticalSection(&filter->lock);
+		filter->result.res = res;
+		filter->result.seq++;
+		filter->result.time_ns = os_gettime_ns();
+		filter->result.valid = true;
+		LeaveCriticalSection(&filter->lock);
+	}
+	return 0;
+}
+#endif
+
+static void worker_start(struct hal_visor_data *filter)
+{
+	filter->worker_started = true;
+#ifdef _WIN32
+	InitializeCriticalSection(&filter->lock);
+	filter->frame_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+	filter->worker_thread = filter->frame_event
+					? CreateThread(NULL, 0, hal_worker_proc,
+						       filter, 0, NULL)
+					: NULL;
+	if (!filter->worker_thread) {
+		blog(LOG_ERROR,
+		     "[hal-visor] ワーカースレッドを作成できませんでした");
+		if (filter->frame_event) {
+			CloseHandle(filter->frame_event);
+			filter->frame_event = NULL;
+		}
+	}
+#endif
+}
+
+static void worker_stop(struct hal_visor_data *filter)
+{
+	if (!filter->worker_started)
+		return;
+	filter->worker_started = false;
+#ifdef _WIN32
+	if (filter->worker_thread) {
+		EnterCriticalSection(&filter->lock);
+		filter->worker_stop = true;
+		LeaveCriticalSection(&filter->lock);
+		SetEvent(filter->frame_event);
+		WaitForSingleObject(filter->worker_thread, INFINITE);
+		CloseHandle(filter->worker_thread);
+		filter->worker_thread = NULL;
+	}
+	if (filter->frame_event) {
+		CloseHandle(filter->frame_event);
+		filter->frame_event = NULL;
+	}
+	DeleteCriticalSection(&filter->lock);
+#endif
+}
+
+/*
+ * マップ済みフレームをワーカーへ渡す (描画スレッド)。
+ * 縮小 (prepare) はここで行い、ワーカーが前フレームを未取得なら落とす。
+ */
+static void publish_frame(struct hal_visor_data *filter,
+			  const uint8_t *pixels, int w, int h, int linesize)
+{
+	if (!filter->detector)
+		return;
+#ifdef _WIN32
+	if (!filter->worker_thread || !filter->frame_event)
+		return;
+	EnterCriticalSection(&filter->lock);
+	if (!filter->worker_stop && !filter->frame.pending) {
+		int in_w = 0, in_h = 0;
+		if (hal_face_detector_prepare(filter->detector, pixels, w, h,
+					      linesize, filter->frame.buf,
+					      &in_w, &in_h)) {
+			filter->frame.in_w = in_w;
+			filter->frame.in_h = in_h;
+			filter->frame.src_w = w;
+			filter->frame.src_h = h;
+			filter->frame.pending = true;
+			filter->frame.seq++;
+			SetEvent(filter->frame_event);
+		}
+	}
+	LeaveCriticalSection(&filter->lock);
+#else
+	int in_w = 0, in_h = 0;
+	if (hal_face_detector_prepare(filter->detector, pixels, w, h,
+				      linesize, filter->frame.buf, &in_w,
+				      &in_h)) {
+		struct hal_face_result res;
+		memset(&res, 0, sizeof(res));
+		hal_face_detector_infer(filter->detector, filter->frame.buf,
+					in_w, in_h, w, h, &res);
+		filter->result.res = res;
+		filter->result.seq++;
+		filter->result.time_ns = os_gettime_ns();
+		filter->result.valid = true;
+	}
+#endif
+}
+
+/*
+ * 最新の検出結果を取り込んで平滑化する (描画スレッド)。
+ * 新しい結果が来た時だけ EMA を1回適用する。見失ったら変換は保持し、
+ * 次に検出した時はスナップ (補間しない) する。
+ */
+static void consume_results(struct hal_visor_data *filter)
+{
+	struct hal_face_result res;
+	memset(&res, 0, sizeof(res));
+	uint64_t seq = 0, rtime = 0;
+	bool valid = false;
+
+	hv_lock(filter);
+	if (filter->result.valid) {
+		res = filter->result.res;
+		seq = filter->result.seq;
+		rtime = filter->result.time_ns;
+		valid = true;
+	}
+	hv_unlock(filter);
+
+	if (!valid || seq == filter->applied_seq)
+		return;
+	filter->applied_seq = seq;
+
+	uint64_t now = os_gettime_ns();
+	bool fresh = (now - rtime) <= HAL_FRESH_NS;
+	if (!fresh || !res.found || res.eye_dist <= 0.0f) {
+		filter->track_lost = true;
+		return;
+	}
+
+	if (!filter->have_track || filter->track_lost) {
+		filter->sm_x = res.eye_mid_x;
+		filter->sm_y = res.eye_mid_y;
+		filter->sm_dist = res.eye_dist;
+		filter->sm_cos = cosf(res.eye_angle);
+		filter->sm_sin = sinf(res.eye_angle);
+	} else {
+		const float a = HAL_SMOOTH;
+		filter->sm_x += (res.eye_mid_x - filter->sm_x) * a;
+		filter->sm_y += (res.eye_mid_y - filter->sm_y) * a;
+		filter->sm_dist += (res.eye_dist - filter->sm_dist) * a;
+		filter->sm_cos += (cosf(res.eye_angle) - filter->sm_cos) * a;
+		filter->sm_sin += (sinf(res.eye_angle) - filter->sm_sin) * a;
+	}
+	filter->have_track = true;
+	filter->track_lost = false;
+
+	if (now - filter->last_log_ns >= 1000000000ULL) {
+		filter->last_log_ns = now;
+		blog(LOG_INFO,
+		     "[hal-visor] 顔検出: score=%.2f 目の中心=(%.0f, %.0f) 目の間隔=%.0f",
+		     res.score, res.eye_mid_x, res.eye_mid_y, res.eye_dist);
+		if (filter->calib_valid) {
+			double cnx = (double)(res.nose_x - res.eye_mid_x) /
+				     (double)res.eye_dist;
+			double cny = (double)(res.nose_y - res.eye_mid_y) /
+				     (double)res.eye_dist;
+			blog(LOG_INFO,
+			     "[hal-visor] 鼻オフセット=(%.2f, %.2f) 正面登録との差=(%.2f, %.2f)",
+			     cnx, cny, cnx - filter->calib_nose_nx,
+			     cny - filter->calib_nose_ny);
+		}
+	}
 }
 
 static void hal_visor_update(void *data, obs_data_t *settings)
 {
-struct hal_visor_data *filter = data;
-const char *path = obs_data_get_string(settings, "image_path");
+	struct hal_visor_data *filter = data;
+	const char *path = obs_data_get_string(settings, "image_path");
 
-filter->pos_x = (int)obs_data_get_int(settings, "pos_x");
-filter->pos_y = (int)obs_data_get_int(settings, "pos_y");
-filter->scale = (int)obs_data_get_int(settings, "scale");
+	filter->pos_x = (int)obs_data_get_int(settings, "pos_x");
+	filter->pos_y = (int)obs_data_get_int(settings, "pos_y");
+	filter->scale = (int)obs_data_get_int(settings, "scale");
+	filter->tracking = obs_data_get_bool(settings, "tracking");
+	filter->width_factor = obs_data_get_double(settings, "width_factor");
+	filter->calib_valid = obs_data_get_bool(settings, "calib_valid");
+	filter->calib_eye_dist = obs_data_get_double(settings, "calib_eye_dist");
+	filter->calib_nose_nx = obs_data_get_double(settings, "calib_nose_nx");
+	filter->calib_nose_ny = obs_data_get_double(settings, "calib_nose_ny");
 
-// 画像パスの更新
-if (!filter->image_path || strcmp(filter->image_path, path)!= 0) {
-bfree(filter->image_path);
-filter->image_path = bstrdup(path);
+	// 画像パスの更新
+	if (!filter->image_path || strcmp(filter->image_path, path) != 0) {
+		bfree(filter->image_path);
+		filter->image_path = bstrdup(path);
 
-obs_enter_graphics();
-gs_image_file_free(&filter->image);
-if (path && *path) {
-gs_image_file_init(&filter->image, path);
-}
-obs_leave_graphics();
-}
+		obs_enter_graphics();
+		gs_image_file_free(&filter->image);
+		if (path && *path) {
+			gs_image_file_init(&filter->image, path);
+		}
+		obs_leave_graphics();
+	}
 }
 
 static void free_capture(struct hal_visor_data *filter)
 {
-if (filter->stage) {
-gs_stagesurface_destroy(filter->stage);
-filter->stage = NULL;
-}
-if (filter->capture) {
-gs_texrender_destroy(filter->capture);
-filter->capture = NULL;
-}
-filter->stage_pending = false;
-filter->stage_w = 0;
-filter->stage_h = 0;
+	if (filter->stage) {
+		gs_stagesurface_destroy(filter->stage);
+		filter->stage = NULL;
+	}
+	if (filter->capture) {
+		gs_texrender_destroy(filter->capture);
+		filter->capture = NULL;
+	}
+	filter->stage_pending = false;
+	filter->stage_w = 0;
+	filter->stage_h = 0;
 }
 
 static void hal_visor_destroy(void *data)
 {
-struct hal_visor_data *filter = data;
+	struct hal_visor_data *filter = data;
 
-obs_enter_graphics();
-gs_image_file_free(&filter->image);
-free_capture(filter);
-obs_leave_graphics();
+	/* 先にワーカーを止めてから検出器や画像を解放する */
+	worker_stop(filter);
 
-hal_face_detector_destroy(filter->detector);
-bfree(filter->image_path);
-bfree(filter);
+	obs_enter_graphics();
+	gs_image_file_free(&filter->image);
+	free_capture(filter);
+	obs_leave_graphics();
+
+	hal_face_detector_destroy(filter->detector);
+	bfree(filter->frame.buf);
+	bfree(filter->worker_buf);
+	bfree(filter->image_path);
+	bfree(filter);
 }
 
 static void *hal_visor_create(obs_data_t *settings, obs_source_t *source)
 {
-struct hal_visor_data *filter = bzalloc(sizeof(struct hal_visor_data));
-filter->source = source;
+	struct hal_visor_data *filter = bzalloc(sizeof(struct hal_visor_data));
+	filter->source = source;
+	filter->frame.buf =
+		bmalloc(sizeof(float) * HAL_FACE_INPUT_MAX_FLOATS);
+	filter->worker_buf =
+		bmalloc(sizeof(float) * HAL_FACE_INPUT_MAX_FLOATS);
 
-hal_visor_update(filter, settings);
-return filter;
+	worker_start(filter);
+	hal_visor_update(filter, settings);
+	return filter;
 }
 
 /* 検出器を遅延初期化する。失敗してもフィルターは従来動作を続ける */
 static void ensure_detector(struct hal_visor_data *filter)
 {
-if (filter->detector || filter->detector_tried)
-return;
-filter->detector_tried = true;
+	if (filter->detector || filter->detector_tried)
+		return;
+	filter->detector_tried = true;
 
-if (!g_model_path) {
-blog(LOG_ERROR,
-"[hal-visor] モデルファイルのパスを解決できませんでした");
-return;
-}
-filter->detector = hal_face_detector_create(g_model_path);
-if (filter->detector)
-blog(LOG_INFO, "[hal-visor] 顔検出の準備ができました: %s",
-g_model_path);
+	if (!g_model_path) {
+		blog(LOG_ERROR,
+		     "[hal-visor] モデルファイルのパスを解決できませんでした");
+		return;
+	}
+	filter->detector = hal_face_detector_create(g_model_path);
+	if (filter->detector)
+		blog(LOG_INFO, "[hal-visor] 顔検出の準備ができました: %s",
+		     g_model_path);
 }
 
 /* キャプチャ用 texrender / stage surface をソースサイズに合わせて用意する */
 static void ensure_capture(struct hal_visor_data *filter, uint32_t cx,
-uint32_t cy)
+			   uint32_t cy)
 {
-if (filter->capture && filter->stage && filter->stage_w == cx &&
-filter->stage_h == cy)
-return;
-free_capture(filter);
-filter->capture = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
-filter->stage = gs_stagesurface_create(cx, cy, GS_BGRA);
-if (filter->capture && filter->stage) {
-filter->stage_w = cx;
-filter->stage_h = cy;
-} else {
-free_capture(filter);
-}
+	if (filter->capture && filter->stage && filter->stage_w == cx &&
+	    filter->stage_h == cy)
+		return;
+	free_capture(filter);
+	filter->capture = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
+	filter->stage = gs_stagesurface_create(cx, cy, GS_BGRA);
+	if (filter->capture && filter->stage) {
+		filter->stage_w = cx;
+		filter->stage_h = cy;
+	} else {
+		free_capture(filter);
+	}
 }
 
-/* バイザー画像を中心 (center_x, center_y) に倍率 s で描く */
+/* バイザー画像を中心 (center_x, center_y) に倍率 s・回転 angle_rad で描く */
 static void draw_visor_image(struct hal_visor_data *filter, float center_x,
-float center_y, float s)
+			     float center_y, float s, float angle_rad)
 {
-gs_effect_t *draw_effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
-gs_eparam_t *image_param =
-gs_effect_get_param_by_name(draw_effect, "image");
-gs_effect_set_texture(image_param, filter->image.texture);
+	gs_effect_t *draw_effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+	gs_eparam_t *image_param =
+		gs_effect_get_param_by_name(draw_effect, "image");
+	gs_effect_set_texture(image_param, filter->image.texture);
 
-gs_blend_state_push();
-gs_enable_color(true, true, true, true);
-gs_blend_function(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA);
+	gs_blend_state_push();
+	gs_enable_color(true, true, true, true);
+	gs_blend_function(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA);
 
-gs_matrix_push();
+	gs_matrix_push();
 
-// 位置移動
-gs_matrix_translate3f(center_x, center_y, 0.0f);
+	// 位置移動
+	gs_matrix_translate3f(center_x, center_y, 0.0f);
 
-// 拡大縮小
-gs_matrix_scale3f(s, s, 1.0f);
+	// 中心まわりの回転 (目の線の傾き)
+	if (angle_rad != 0.0f)
+		gs_matrix_rotaa4f(0.0f, 0.0f, 1.0f, angle_rad);
 
-// 画像の中心を基準にする
-float half_w = (float)filter->image.cx * 0.5f;
-float half_h = (float)filter->image.cy * 0.5f;
-gs_matrix_translate3f(-half_w, -half_h, 0.0f);
+	// 拡大縮小
+	gs_matrix_scale3f(s, s, 1.0f);
 
-// 安全なエフェクトループで描画
-while (gs_effect_loop(draw_effect, "Draw")) {
-gs_draw_sprite(filter->image.texture, 0, filter->image.cx,
-filter->image.cy);
-}
+	// 画像の中心を基準にする
+	float half_w = (float)filter->image.cx * 0.5f;
+	float half_h = (float)filter->image.cy * 0.5f;
+	gs_matrix_translate3f(-half_w, -half_h, 0.0f);
 
-gs_matrix_pop();
-gs_blend_state_pop();
+	// 安全なエフェクトループで描画
+	while (gs_effect_loop(draw_effect, "Draw")) {
+		gs_draw_sprite(filter->image.texture, 0, filter->image.cx,
+			       filter->image.cy);
+	}
+
+	gs_matrix_pop();
+	gs_blend_state_pop();
 }
 
 static void hal_visor_video_render(void *data, gs_effect_t *effect)
 {
-struct hal_visor_data *filter = data;
+	struct hal_visor_data *filter = data;
 
-// OBSからeffectが渡ってこない場合の安全策
-if (!effect)
-effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+	// OBSからeffectが渡ってこない場合の安全策
+	if (!effect)
+		effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
 
-obs_source_t *target = obs_filter_get_target(filter->source);
-uint32_t cx = target? obs_source_get_base_width(target): 0;
-uint32_t cy = target? obs_source_get_base_height(target): 0;
+	obs_source_t *target = obs_filter_get_target(filter->source);
+	uint32_t cx = target ? obs_source_get_base_width(target) : 0;
+	uint32_t cy = target ? obs_source_get_base_height(target) : 0;
 
-bool captured = false;
-if (cx && cy) {
-ensure_capture(filter, cx, cy);
-if (filter->capture) {
-gs_texrender_reset(filter->capture);
-if (gs_texrender_begin(filter->capture, cx, cy)) {
-struct vec4 clear_color;
-vec4_set(&clear_color, 0.0f, 0.0f, 0.0f, 0.0f);
-gs_clear(GS_CLEAR_COLOR, &clear_color, 0.0f,
-0);
-// 親ソースを自前 texrender へ描く
-if (obs_source_process_filter_begin(
-filter->source, GS_RGBA,
-OBS_NO_DIRECT_RENDERING)) {
-obs_source_process_filter_end(
-filter->source,
-obs_get_base_effect(
-OBS_EFFECT_DEFAULT),
-(int)cx, (int)cy);
-captured = true;
-}
-gs_texrender_end(filter->capture);
-}
-}
+	bool captured = false;
+	if (cx && cy) {
+		ensure_capture(filter, cx, cy);
+		if (filter->capture) {
+			gs_texrender_reset(filter->capture);
+			if (gs_texrender_begin(filter->capture, cx, cy)) {
+				struct vec4 clear_color;
+				vec4_set(&clear_color, 0.0f, 0.0f, 0.0f, 0.0f);
+				gs_clear(GS_CLEAR_COLOR, &clear_color, 0.0f,
+					 0);
+				// 親ソースを自前 texrender へ描く
+				if (obs_source_process_filter_begin(
+					    filter->source, GS_RGBA,
+					    OBS_NO_DIRECT_RENDERING)) {
+					obs_source_process_filter_end(
+						filter->source,
+						obs_get_base_effect(
+							OBS_EFFECT_DEFAULT),
+						(int)cx, (int)cy);
+					captured = true;
+				}
+				gs_texrender_end(filter->capture);
+			}
+		}
+	}
+
+	if (captured) {
+		// キャプチャした映像をフィルターの出力として描く
+		gs_effect_t *draw_effect =
+			obs_get_base_effect(OBS_EFFECT_DEFAULT);
+		gs_eparam_t *image_param =
+			gs_effect_get_param_by_name(draw_effect, "image");
+		gs_texture_t *tex = gs_texrender_get_texture(filter->capture);
+		gs_effect_set_texture(image_param, tex);
+
+		gs_blend_state_push();
+		gs_blend_function(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA);
+		while (gs_effect_loop(draw_effect, "Draw")) {
+			gs_draw_sprite(tex, 0, cx, cy);
+		}
+		gs_blend_state_pop();
+	} else {
+		// 従来どおり: 親ソースをそのまま出力する
+		if (!obs_source_process_filter_begin(filter->source, GS_RGBA,
+						     OBS_NO_DIRECT_RENDERING))
+			return;
+		obs_source_process_filter_end(filter->source, effect, 0, 0);
+	}
+
+	// ---- ステップ3: 顔検出 (推論はワーカースレッド) ----
+	filter->frame_count++;
+
+	// 前回コピーしたフレームをマップしてワーカーへ渡す
+	if (filter->stage_pending && filter->stage) {
+		uint8_t *pixels = NULL;
+		uint32_t linesize = 0;
+		if (gs_stagesurface_map(filter->stage, &pixels, &linesize) &&
+		    pixels) {
+			ensure_detector(filter);
+			if (filter->detector)
+				publish_frame(filter, pixels, (int)cx, (int)cy,
+					      (int)linesize);
+			gs_stagesurface_unmap(filter->stage);
+		}
+		filter->stage_pending = false;
+	}
+
+	// 3回に1回、キャプチャを stage surface へコピーする (次回マップする)
+	if (captured && filter->stage && (filter->frame_count % 3) == 0) {
+		gs_copy_texture((gs_texture_t *)filter->stage,
+				gs_texrender_get_texture(filter->capture));
+		filter->stage_pending = true;
+	}
+
+	// 最新の検出結果を取り込んで平滑化する
+	consume_results(filter);
+
+	// バイザー画像を描画
+	if (filter->image.loaded && filter->image.texture) {
+		if (filter->tracking && filter->have_track &&
+		    filter->sm_dist > 0.0f) {
+			// 追従: 平滑化済みの目位置・間隔・角度で1回だけ描く。
+			// 検出が途切れても最後の変換を保持する (隠し続ける)。
+			float ts = (float)((double)filter->sm_dist *
+					   filter->width_factor) /
+				   (float)filter->image.cx;
+			float ang = atan2f(filter->sm_sin, filter->sm_cos);
+			draw_visor_image(filter, filter->sm_x, filter->sm_y,
+					 ts, ang);
+		} else {
+			// 従来のスライダー位置
+			float s = (float)filter->scale / 100.0f;
+			draw_visor_image(filter, (float)filter->pos_x,
+					 (float)filter->pos_y, s, 0.0f);
+		}
+	}
 }
 
-if (captured) {
-// キャプチャした映像をフィルターの出力として描く
-gs_effect_t *draw_effect =
-obs_get_base_effect(OBS_EFFECT_DEFAULT);
-gs_eparam_t *image_param =
-gs_effect_get_param_by_name(draw_effect, "image");
-gs_texture_t *tex = gs_texrender_get_texture(filter->capture);
-gs_effect_set_texture(image_param, tex);
+/* 「正面を登録」ボタン: 最新の検出形状を正面として設定へ保存する */
+static bool hal_calib_clicked(obs_properties_t *props,
+			      obs_property_t *property, void *data)
+{
+	UNUSED_PARAMETER(props);
+	UNUSED_PARAMETER(property);
+	struct hal_visor_data *filter = data;
+	if (!filter)
+		return false;
 
-gs_blend_state_push();
-gs_blend_function(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA);
-while (gs_effect_loop(draw_effect, "Draw")) {
-gs_draw_sprite(tex, 0, cx, cy);
-}
-gs_blend_state_pop();
-} else {
-// 従来どおり: 親ソースをそのまま出力する
-if (!obs_source_process_filter_begin(filter->source, GS_RGBA,
-OBS_NO_DIRECT_RENDERING))
-return;
-obs_source_process_filter_end(filter->source, effect, 0, 0);
-}
+	struct hal_face_result res;
+	memset(&res, 0, sizeof(res));
+	uint64_t rtime = 0;
+	bool valid = false;
 
-// ---- ステップ2: 顔検出の配管 ----
-filter->frame_count++;
+	hv_lock(filter);
+	if (filter->result.valid) {
+		res = filter->result.res;
+		rtime = filter->result.time_ns;
+		valid = true;
+	}
+	hv_unlock(filter);
 
-// 前回コピーしたフレームをマップして推論する
-if (filter->stage_pending && filter->stage) {
-uint8_t *pixels = NULL;
-uint32_t linesize = 0;
-if (gs_stagesurface_map(filter->stage, &pixels, &linesize) &&
-pixels) {
-ensure_detector(filter);
-if (filter->detector) {
-struct hal_face_result res;
-if (hal_face_detector_run(
-filter->detector, pixels, (int)cx,
-(int)cy, (int)linesize, &res)) {
-filter->face = res;
-uint64_t now = os_gettime_ns();
-if (now - filter->last_log_ns >=
-1000000000ULL) {
-filter->last_log_ns = now;
-blog(LOG_INFO,
-"[hal-visor] 顔検出: score=%.2f 目の中心=(%.0f, %.0f) 目の間隔=%.0f",
-res.score,
-res.eye_mid_x,
-res.eye_mid_y,
-res.eye_dist);
-}
-} else {
-filter->face.found = false;
-}
-}
-gs_stagesurface_unmap(filter->stage);
-}
-filter->stage_pending = false;
-}
+	uint64_t now = os_gettime_ns();
+	if (!valid || !res.found || res.eye_dist <= 0.0f ||
+	    (now - rtime) > HAL_FRESH_NS) {
+		blog(LOG_WARNING,
+		     "[hal-visor] 正面登録に失敗しました: 顔が検出できていません");
+		return false;
+	}
 
-// 3回に1回、キャプチャを stage surface へコピーする (次回マップする)
-if (captured && filter->stage && (filter->frame_count % 3) == 0) {
-gs_copy_texture((gs_texture_t *)filter->stage,
-gs_texrender_get_texture(filter->capture));
-filter->stage_pending = true;
-}
+	double nx = (double)(res.nose_x - res.eye_mid_x) /
+		    (double)res.eye_dist;
+	double ny = (double)(res.nose_y - res.eye_mid_y) /
+		    (double)res.eye_dist;
 
-// バイザー画像を描画 (従来のスライダー位置)
-if (filter->image.loaded && filter->image.texture) {
-float s = (float)filter->scale / 100.0f;
-draw_visor_image(filter, (float)filter->pos_x,
-(float)filter->pos_y, s);
+	filter->calib_valid = true;
+	filter->calib_eye_dist = (double)res.eye_dist;
+	filter->calib_nose_nx = nx;
+	filter->calib_nose_ny = ny;
 
-// 配管確認用マーカー: 検出した目の中心にもう1枚描く
-// (幅が目の間隔の約3倍になる倍率)
-if (filter->face.found && filter->face.eye_dist > 0.0f) {
-float ms = (3.0f * filter->face.eye_dist) /
-(float)filter->image.cx;
-draw_visor_image(filter, filter->face.eye_mid_x,
-filter->face.eye_mid_y, ms);
-}
-}
+	obs_data_t *settings = obs_source_get_settings(filter->source);
+	obs_data_set_bool(settings, "calib_valid", true);
+	obs_data_set_double(settings, "calib_eye_dist",
+			    filter->calib_eye_dist);
+	obs_data_set_double(settings, "calib_nose_nx", nx);
+	obs_data_set_double(settings, "calib_nose_ny", ny);
+	obs_data_release(settings);
+
+	blog(LOG_INFO,
+	     "[hal-visor] 正面を登録しました: 目の間隔=%.0f 鼻オフセット=(%.2f, %.2f)",
+	     res.eye_dist, nx, ny);
+	return false;
 }
 
 static obs_properties_t *hal_visor_properties(void *data)
 {
-UNUSED_PARAMETER(data);
-obs_properties_t *props = obs_properties_create();
+	obs_properties_t *props = obs_properties_create();
 
-obs_properties_add_path(props, "image_path", "バイザー画像",
-OBS_PATH_FILE,
-"Image Files (*.png *.jpg *.jpeg *.bmp *.webp);;All Files (*.*)",
-NULL);
+	obs_properties_add_path(props, "image_path", "バイザー画像",
+				OBS_PATH_FILE,
+				"Image Files (*.png *.jpg *.jpeg *.bmp *.webp);;All Files (*.*)",
+				NULL);
 
-obs_properties_add_int_slider(props, "pos_x", "位置 X", 0, 1920, 1);
-obs_properties_add_int_slider(props, "pos_y", "位置 Y", 0, 1080, 1);
-obs_properties_add_int_slider(props, "scale", "サイズ (%)", 10, 500, 1);
+	obs_properties_add_int_slider(props, "pos_x", "位置 X", 0, 1920, 1);
+	obs_properties_add_int_slider(props, "pos_y", "位置 Y", 0, 1080, 1);
+	obs_properties_add_int_slider(props, "scale", "サイズ (%)", 10, 500, 1);
 
-return props;
+	obs_properties_add_bool(props, "tracking", "顔追従");
+	obs_properties_add_float_slider(props, "width_factor", "幅の倍率",
+					1.0, 6.0, 0.1);
+	obs_properties_add_button2(props, "calib_button", "正面を登録",
+				   hal_calib_clicked, data);
+
+	return props;
 }
 
 static void hal_visor_defaults(obs_data_t *settings)
 {
-obs_data_set_default_int(settings, "pos_x", 960);
-obs_data_set_default_int(settings, "pos_y", 540);
-obs_data_set_default_int(settings, "scale", 100);
+	obs_data_set_default_int(settings, "pos_x", 960);
+	obs_data_set_default_int(settings, "pos_y", 540);
+	obs_data_set_default_int(settings, "scale", 100);
+	obs_data_set_default_bool(settings, "tracking", true);
+	obs_data_set_default_double(settings, "width_factor", 3.0);
+	obs_data_set_default_bool(settings, "calib_valid", false);
 }
 
 struct obs_source_info hal_visor_filter_info = {
-.id = "hal_visor_filter",
-.type = OBS_SOURCE_TYPE_FILTER,
-.output_flags = OBS_SOURCE_VIDEO,
-.get_name = hal_visor_get_name,
-.create = hal_visor_create,
-.destroy = hal_visor_destroy,
-.update = hal_visor_update,
-.get_defaults = hal_visor_defaults,
-.get_properties = hal_visor_properties,
-.video_render = hal_visor_video_render,
+	.id = "hal_visor_filter",
+	.type = OBS_SOURCE_TYPE_FILTER,
+	.output_flags = OBS_SOURCE_VIDEO,
+	.get_name = hal_visor_get_name,
+	.create = hal_visor_create,
+	.destroy = hal_visor_destroy,
+	.update = hal_visor_update,
+	.get_defaults = hal_visor_defaults,
+	.get_properties = hal_visor_properties,
+	.video_render = hal_visor_video_render,
 };
 
 bool obs_module_load(void)
 {
-obs_register_source(&hal_visor_filter_info);
-g_model_path = obs_module_file("face_detection_yunet_2023mar.onnx");
-return true;
+	obs_register_source(&hal_visor_filter_info);
+	g_model_path = obs_module_file("face_detection_yunet_2023mar.onnx");
+	return true;
 }
 
 void obs_module_unload(void)
 {
-bfree(g_model_path);
-g_model_path = NULL;
+	bfree(g_model_path);
+	g_model_path = NULL;
 }
