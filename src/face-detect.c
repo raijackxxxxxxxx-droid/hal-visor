@@ -89,8 +89,8 @@ struct hal_face_detector *hal_face_detector_create(const char *model_path)
 	if (!ort_ok(d, st, "CreateCpuMemoryInfo"))
 		goto fail;
 
-	st = api->SessionGetAllocator(d->session, &alloc);
-	if (!ort_ok(d, st, "SessionGetAllocator"))
+	st = api->GetAllocatorWithDefaultOptions(&alloc);
+	if (!ort_ok(d, st, "GetAllocatorWithDefaultOptions"))
 		goto fail;
 
 	{
@@ -105,11 +105,11 @@ struct hal_face_detector *hal_face_detector_create(const char *model_path)
 	/* モデル入力が固定サイズならそれに従う (動的なら -1 が返る) */
 	{
 		OrtTypeInfo *tinfo = NULL;
-		OrtTensorTypeAndShapeInfo *tsinfo = NULL;
+		const OrtTensorTypeAndShapeInfo *tsinfo = NULL;
 		st = api->SessionGetInputTypeInfo(d->session, 0, &tinfo);
 		if (ort_ok(d, st, "SessionGetInputTypeInfo")) {
-			st = api->GetTensorTypeAndShapeInfo(tinfo, &tsinfo);
-			if (ort_ok(d, st, "GetTensorTypeAndShapeInfo")) {
+			st = api->CastTypeInfoToTensorInfo(tinfo, &tsinfo);
+			if (ort_ok(d, st, "CastTypeInfoToTensorInfo")) {
 				size_t n = 0;
 				api->GetDimensionsCount(tsinfo, &n);
 				if (n == 4) {
@@ -127,7 +127,7 @@ struct hal_face_detector *hal_face_detector_create(const char *model_path)
 					     (long long)dims[2],
 					     (long long)dims[3]);
 				}
-				api->ReleaseTensorTypeAndShapeInfo(tsinfo);
+				/* Cast で得た info は TypeInfo 側が所有するので個別解放しない */
 			}
 			api->ReleaseTypeInfo(tinfo);
 		}
