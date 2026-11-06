@@ -294,15 +294,13 @@ static int find_output(struct hal_face_detector *d, const char *prefix,
 	return -1;
 }
 
-bool hal_face_detector_run(struct hal_face_detector *det,
-			   const unsigned char *bgra, int src_w, int src_h,
-			   int linesize, struct hal_face_result *out)
+bool hal_face_detector_prepare(struct hal_face_detector *det,
+			       const unsigned char *bgra, int src_w,
+			       int src_h, int linesize, float *dst,
+			       int *out_w, int *out_h)
 {
-	out->found = false;
-	if (!det || !bgra || src_w <= 0 || src_h <= 0)
+	if (!det || !bgra || !dst || src_w <= 0 || src_h <= 0)
 		return false;
-	const OrtApi *api = det->api;
-	OrtStatus *st = NULL;
 
 	/* 入力サイズ: 幅 320 目安、高さは 32 の倍数 (固定サイズモデルならそれ) */
 	int in_w = HAL_MAX_IN;
@@ -325,20 +323,38 @@ bool hal_face_detector_run(struct hal_face_detector *det,
 			for (int ix = 0; ix < in_w; ix++) {
 				int sx = (int)((int64_t)ix * src_w / in_w);
 				const unsigned char *p = row + sx * 4;
-				float *dst = det->input_buf + iy * in_w + ix;
-				dst[0 * plane] = (float)p[0]; /* B */
-				dst[1 * plane] = (float)p[1]; /* G */
-				dst[2 * plane] = (float)p[2]; /* R */
+				float *d = dst + iy * in_w + ix;
+				d[0 * plane] = (float)p[0]; /* B */
+				d[1 * plane] = (float)p[1]; /* G */
+				d[2 * plane] = (float)p[2]; /* R */
 			}
 		}
 	}
+	if (out_w)
+		*out_w = in_w;
+	if (out_h)
+		*out_h = in_h;
+	return true;
+}
+
+bool hal_face_detector_infer(struct hal_face_detector *det,
+			     const float *input, int in_w, int in_h,
+			     int src_w, int src_h,
+			     struct hal_face_result *out)
+{
+	out->found = false;
+	if (!det || !input || in_w <= 0 || in_h <= 0 || src_w <= 0 ||
+	    src_h <= 0)
+		return false;
+	const OrtApi *api = det->api;
+	OrtStatus *st = NULL;
 
 	OrtValue *in_tensor = NULL;
 	OrtValue **outputs = bzalloc(sizeof(OrtValue *) * det->num_outputs);
 	{
 		int64_t shape[4] = {1, 3, in_h, in_w};
 		st = api->CreateTensorWithDataAsOrtValue(
-			det->mem_info, det->input_buf,
+			det->mem_info, (void *)input,
 			sizeof(float) * 3 * (size_t)in_w * in_h, shape, 4,
 			ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &in_tensor);
 		if (!ort_ok(det, st, "CreateTensorWithDataAsOrtValue"))
@@ -498,6 +514,9 @@ bool hal_face_detector_run(struct hal_face_detector *det,
 				out->eye_mid_x = (ex0 + ex1) * 0.5f;
 				out->eye_mid_y = (ey0 + ey1) * 0.5f;
 				out->eye_dist = sqrtf(dx * dx + dy * dy);
+				out->eye_angle = atan2f(dy, dx);
+				out->nose_x = best->kps[4] * fx;
+				out->nose_y = best->kps[5] * fy;
 				out->box_x = best->x0 * fx;
 				out->box_y = best->y0 * fy;
 				out->box_w = (best->x1 - best->x0) * fx;
@@ -519,4 +538,18 @@ done:
 		bfree(outputs);
 	}
 	return out->found;
+}
+
+bool hal_face_detector_run(struct hal_face_detector *det,
+			   const unsigned char *bgra, int src_w, int src_h,
+			   int linesize, struct hal_face_result *out)
+{
+	int in_w = 0, in_h = 0;
+	if (!hal_face_detector_prepare(det, bgra, src_w, src_h, linesize,
+				       det->input_buf, &in_w, &in_h)) {
+		out->found = false;
+		return false;
+	}
+	return hal_face_detector_infer(det, det->input_buf, in_w, in_h,
+				       src_w, src_h, out);
 }
