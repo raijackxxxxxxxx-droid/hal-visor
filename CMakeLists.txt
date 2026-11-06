@@ -37,3 +37,27 @@ endif()
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/plugin-main.c)
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
+
+# ONNX Runtime (YuNet顔検出用, Windows x64のみ): 公式リリースzipを取得してリンクし、
+# 実行時DLLをプラグインDLLの隣へコピーする
+if(WIN32)
+  include(FetchContent)
+  FetchContent_Declare(
+    onnxruntime
+    URL https://github.com/microsoft/onnxruntime/releases/download/v1.20.1/onnxruntime-win-x64-1.20.1.zip
+    URL_HASH SHA256=78d447051e48bd2e1e778bba378bec4ece11191c9e538cf7b2c4a4565e8f5581
+  )
+  FetchContent_MakeAvailable(onnxruntime)
+  target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${onnxruntime_SOURCE_DIR}/include)
+  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ${onnxruntime_SOURCE_DIR}/lib/onnxruntime.lib)
+  add_custom_command(
+    TARGET ${CMAKE_PROJECT_NAME}
+    POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${onnxruntime_SOURCE_DIR}/lib/onnxruntime.dll"
+            "$<TARGET_FILE_DIR:${CMAKE_PROJECT_NAME}>"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${onnxruntime_SOURCE_DIR}/lib/onnxruntime.dll"
+            "${CMAKE_CURRENT_BINARY_DIR}/rundir/$<CONFIG>"
+    COMMENT "Copy onnxruntime.dll next to the plugin DLL"
+    VERBATIM
+  )
+endif()
