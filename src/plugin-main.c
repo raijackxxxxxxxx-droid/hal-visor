@@ -23,6 +23,17 @@ static char *g_model_path = NULL;
 #define HAL_FRESH_NS 500000000ULL
 #define HAL_SMOOTH 0.35f
 
+/* 角度推定のゲインと上限 (rad)。最終調整で詰める前提の初期値 */
+#define HAL_YAW_GAIN 2.2f
+#define HAL_PITCH_GAIN 2.2f
+#define HAL_YAW_MAX 0.9f
+#define HAL_PITCH_MAX 0.6f
+
+static float hv_clampf(float v, float lo, float hi)
+{
+	return v < lo ? lo : (v > hi ? hi : v);
+}
+
 /* 描画スレッド → ワーカー へのフレーム受け渡しスロット (lock で保護) */
 struct hv_frame_slot {
 	float *buf;
@@ -53,6 +64,8 @@ struct hal_visor_data {
 	/* ステップ3: 追従の設定 */
 	bool tracking;
 	double width_factor;
+	/* ステップ4: 変形の強さ (%) */
+	int deform;
 	/* 正面登録 (フィルター設定に永続化される) */
 	bool calib_valid;
 	double calib_eye_dist;
@@ -89,6 +102,8 @@ struct hal_visor_data {
 	float sm_dist;
 	float sm_cos;
 	float sm_sin;
+	float sm_nose_x;
+	float sm_nose_y;
 	uint64_t applied_seq;
 };
 
@@ -257,6 +272,40 @@ static void publish_frame(struct hal_visor_data *filter,
 }
 
 /*
+ * 平滑化済みの状態から、正面登録を基準とした顔の向き (yaw/pitch, rad) を
+ * 推定する。鼻のずれは目の線の角度ぶん逆回転させてから正規化し、
+ * 顔自身の座標系で測る (ロールと切り離すため)。
+ * strength は倍率 (1.0 = 推定そのまま)。登録が無ければ両方 0。
+ * 座標系: x は右目→左目の向き、y は画像の下向き。
+ *   yaw > 0 = 鼻が左目側へ寄った (= 被写体が自分の左を向いた) 向き。
+ *   pitch > 0 = 鼻が目の線より下へ寄った (= うつむいた) 向き。
+ */
+static void estimate_angles(struct hal_visor_data *filter, float strength,
+			    float *out_yaw, float *out_pitch)
+{
+	*out_yaw = 0.0f;
+	*out_pitch = 0.0f;
+	if (!filter->calib_valid || filter->sm_dist <= 0.0f)
+		return;
+
+	float vx = filter->sm_nose_x - filter->sm_x;
+	float vy = filter->sm_nose_y - filter->sm_y;
+	float rx = filter->sm_cos * vx + filter->sm_sin * vy;
+	float ry = -filter->sm_sin * vx + filter->sm_cos * vy;
+	float nx = rx / filter->sm_dist;
+	float ny = ry / filter->sm_dist;
+
+	*out_yaw = hv_clampf((nx - (float)filter->calib_nose_nx) *
+				     HAL_YAW_GAIN,
+			     -HAL_YAW_MAX, HAL_YAW_MAX) *
+		   strength;
+	*out_pitch = hv_clampf((ny - (float)filter->calib_nose_ny) *
+				       HAL_PITCH_GAIN,
+			       -HAL_PITCH_MAX, HAL_PITCH_MAX) *
+		     strength;
+}
+
+/*
  * 最新の検出結果を取り込んで平滑化する (描画スレッド)。
  * 新しい結果が来た時だけ EMA を1回適用する。見失ったら変換は保持し、
  * 次に検出した時はスナップ (補間しない) する。
@@ -294,6 +343,8 @@ static void consume_results(struct hal_visor_data *filter)
 		filter->sm_dist = res.eye_dist;
 		filter->sm_cos = cosf(res.eye_angle);
 		filter->sm_sin = sinf(res.eye_angle);
+		filter->sm_nose_x = res.nose_x;
+		filter->sm_nose_y = res.nose_y;
 	} else {
 		const float a = HAL_SMOOTH;
 		filter->sm_x += (res.eye_mid_x - filter->sm_x) * a;
@@ -301,6 +352,8 @@ static void consume_results(struct hal_visor_data *filter)
 		filter->sm_dist += (res.eye_dist - filter->sm_dist) * a;
 		filter->sm_cos += (cosf(res.eye_angle) - filter->sm_cos) * a;
 		filter->sm_sin += (sinf(res.eye_angle) - filter->sm_sin) * a;
+		filter->sm_nose_x += (res.nose_x - filter->sm_nose_x) * a;
+		filter->sm_nose_y += (res.nose_y - filter->sm_nose_y) * a;
 	}
 	filter->have_track = true;
 	filter->track_lost = false;
@@ -319,6 +372,12 @@ static void consume_results(struct hal_visor_data *filter)
 			     "[hal-visor] 鼻オフセット=(%.2f, %.2f) 正面登録との差=(%.2f, %.2f)",
 			     cnx, cny, cnx - filter->calib_nose_nx,
 			     cny - filter->calib_nose_ny);
+			float eyaw = 0.0f, epitch = 0.0f;
+			estimate_angles(filter, 1.0f, &eyaw, &epitch);
+			blog(LOG_INFO,
+			     "[hal-visor] 角度推定: yaw=%.0f° pitch=%.0f°",
+			     (double)(eyaw * 57.29578f),
+			     (double)(epitch * 57.29578f));
 		}
 	}
 }
@@ -333,6 +392,7 @@ static void hal_visor_update(void *data, obs_data_t *settings)
 	filter->scale = (int)obs_data_get_int(settings, "scale");
 	filter->tracking = obs_data_get_bool(settings, "tracking");
 	filter->width_factor = obs_data_get_double(settings, "width_factor");
+	filter->deform = (int)obs_data_get_int(settings, "deform");
 	filter->calib_valid = obs_data_get_bool(settings, "calib_valid");
 	filter->calib_eye_dist = obs_data_get_double(settings, "calib_eye_dist");
 	filter->calib_nose_nx = obs_data_get_double(settings, "calib_nose_nx");
@@ -657,6 +717,8 @@ static obs_properties_t *hal_visor_properties(void *data)
 	obs_properties_add_bool(props, "tracking", "顔追従");
 	obs_properties_add_float_slider(props, "width_factor", "幅の倍率",
 					1.0, 6.0, 0.1);
+	obs_properties_add_int_slider(props, "deform", "変形の強さ", 0, 200,
+				      1);
 	obs_properties_add_button2(props, "calib_button", "正面を登録",
 				   hal_calib_clicked, data);
 
@@ -670,6 +732,7 @@ static void hal_visor_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "scale", 100);
 	obs_data_set_default_bool(settings, "tracking", true);
 	obs_data_set_default_double(settings, "width_factor", 3.0);
+	obs_data_set_default_int(settings, "deform", 100);
 	obs_data_set_default_bool(settings, "calib_valid", false);
 }
 
