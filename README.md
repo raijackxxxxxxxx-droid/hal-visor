@@ -1,59 +1,56 @@
-# OBS Plugin Template
+# HaL-VISOR
 
-## Introduction
+顔出し配信で目元を隠すための OBS Studio 用ビデオフィルターです。
+カメラ映像から顔を検出し、目の位置に合わせてバイザー画像を自動で追従表示します。顔の傾きや向き（左右・上下）に合わせてバイザーの位置・大きさ・傾きが変わり、向きに応じて弱い透視変形もかかります。
 
-The plugin template is meant to be used as a starting point for OBS Studio plugin development. It includes:
+サングラスをかけなくても目元を隠せるので、配信中でもコメントや画面が素の目で読みやすく…なることを目指したプラグインです。
 
-* Boilerplate plugin source code
-* A CMake project file
-* GitHub Actions workflows and repository actions
+## 動作環境
 
-## Supported Build Environments
+- Windows（x64）
+- OBS Studio 31.x（OBS 31.1.1 向けにビルドしています）
 
-| Platform  | Tool   |
-|-----------|--------|
-| Windows   | Visual Studio 17 2022 |
-| macOS     | XCode 16.0 |
-| Windows, macOS  | CMake 3.30.5 |
-| Ubuntu 24.04 | CMake 3.28.3 |
-| Ubuntu 24.04 | `ninja-build` |
-| Ubuntu 24.04 | `pkg-config`
-| Ubuntu 24.04 | `build-essential` |
+## インストール
 
-## Quick Start
+ビルド成果物（GitHub Actions の Artifacts、または配布 zip）の中身を、OBS Studio のインストールフォルダに配置します。
 
-An absolute bare-bones [Quick Start Guide](https://github.com/obsproject/obs-plugintemplate/wiki/Quick-Start-Guide) is available in the wiki.
+| ファイル | 配置先 |
+| --- | --- |
+| `hal-visor.dll` | `C:\Program Files\obs-studio\obs-plugins\64bit\` |
+| `onnxruntime.dll` | `C:\Program Files\obs-studio\obs-plugins\64bit\`（`hal-visor.dll` と同じフォルダ） |
+| `face_detection_yunet_2023mar.onnx` | `C:\Program Files\obs-studio\data\obs-plugins\hal-visor\` |
 
-## Documentation
+配置したら OBS Studio を再起動してください。カメラ映像のソースにフィルター **「HaL Visor」** が追加できるようになります。
 
-All documentation can be found in the [Plugin Template Wiki](https://github.com/obsproject/obs-plugintemplate/wiki).
+> 古いバージョン（`plugintemplate-for-obs.dll`）を使っていた場合は、古い DLL と `data\obs-plugins\plugintemplate-for-obs\` フォルダを削除してから入れてください。フィルターの設定（シーン側の保存情報）はそのまま引き継がれます。
 
-Suggested reading to get up and running:
+## 使い方
 
-* [Getting started](https://github.com/obsproject/obs-plugintemplate/wiki/Getting-Started)
-* [Build system requirements](https://github.com/obsproject/obs-plugintemplate/wiki/Build-System-Requirements)
-* [Build system options](https://github.com/obsproject/obs-plugintemplate/wiki/CMake-Build-System-Options)
+1. カメラ映像のソースを右クリックし、「フィルタ」から **HaL Visor** を追加します。
+2. **バイザー画像** に、目元を隠すための画像（PNG など、透過画像がおすすめ）を選びます。
+3. カメラを正面から見た状態で、フィルター設定の **「正面を登録」** ボタンを押します。これが変形計算の基準になります。
+4. **幅の倍率** で目の間隔に対するバイザーの横幅を、**変形の強さ** で顔の向きへの追従変形の効き具合を調整します。
 
-## GitHub Actions & CI
+## 設定項目
 
-Default GitHub Actions workflows are available for the following repository actions:
+| 項目 | 説明 |
+| --- | --- |
+| バイザー画像 | 目元に重ねる画像ファイル |
+| 位置 X / 位置 Y / サイズ (%) | 顔追従がオフのとき（または顔が一度も検出されていないとき）の固定表示位置と大きさ |
+| 顔追従 | オンにすると検出した顔に合わせてバイザーが動きます（既定: オン） |
+| 幅の倍率 | 目の間隔の何倍の横幅でバイザーを表示するか（1.0〜6.0、既定: 3.0） |
+| 変形の強さ | 正面登録を基準に、顔の向きに合わせてバイザーを変形させる強さ（0〜200%、既定: 100%。0 で変形なし） |
+| 正面を登録 | 正面を向いた状態で押すと、その顔の配置を基準として記録します |
 
-* `push`: Run for commits or tags pushed to `master` or `main` branches.
-* `pr-pull`: Run when a Pull Request has been pushed or synchronized.
-* `dispatch`: Run when triggered by the workflow dispatch in GitHub's user interface.
-* `build-project`: Builds the actual project and is triggered by other workflows.
-* `check-format`: Checks CMake and plugin source code formatting and is triggered by other workflows.
+## 備考
 
-The workflows make use of GitHub repository actions (contained in `.github/actions`) and build scripts (contained in `.github/scripts`) which are not needed for local development, but might need to be adjusted if additional/different steps are required to build the plugin.
+- 顔検出は ONNX Runtime と YuNet モデルで **すべてローカルで処理** します。映像が外部に送信されることはありません。
+- 顔を見失った場合、バイザーは最後に検出した位置にそのまま留まります（目元が露出しないための仕様です）。
+- **顔追従** をオフにすると、位置 X / Y・サイズで指定した固定位置のオーバーレイとして使えます。
+- 検出や正面登録の様子は OBS のログ（ヘルプ → ログファイル）に出力されます。うまく動かないときはログの `[hal-visor]` 行を確認してください。
 
-### Retrieving build artifacts
+## ライセンス・クレジット
 
-Successful builds on GitHub Actions will produce build artifacts that can be downloaded for testing. These artifacts are commonly simple archives and will not contain package installers or installation programs.
-
-### Building a Release
-
-To create a release, an appropriately named tag needs to be pushed to the `main`/`master` branch using semantic versioning (e.g., `12.3.4`, `23.4.5-beta2`). A draft release will be created on the associated repository with generated installer packages or installation programs attached as release artifacts.
-
-## Signing and Notarizing on macOS
-
-Basic concepts of codesigning and notarization on macOS are explained in the correspodning [Wiki article](https://github.com/obsproject/obs-plugintemplate/wiki/Codesigning-On-macOS) which has a specific section for the [GitHub Actions setup](https://github.com/obsproject/obs-plugintemplate/wiki/Codesigning-On-macOS#setting-up-code-signing-for-github-actions).
+- HaL-VISOR 本体: GNU General Public License v2.0（同梱の [LICENSE](LICENSE) を参照）
+- 顔検出モデル: [YuNet](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet)（OpenCV Zoo、Apache License 2.0）
+- 推論ランタイム: [ONNX Runtime](https://github.com/microsoft/onnxruntime)（MIT License）
