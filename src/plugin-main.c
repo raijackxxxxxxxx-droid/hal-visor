@@ -24,6 +24,9 @@ static char *g_model_path = NULL;
 /* 検出結果が「新鮮」と言える上限 (ns) と、平滑化の係数 */
 #define HAL_FRESH_NS 500000000ULL
 #define HAL_SMOOTH 0.35f
+/* ステップ11: 解析パス (キャプチャ+発行) の最小間隔。これと
+ * 「3回に1回」の両方を満たした時だけ解析パスを走らせる */
+#define HAL_ANALYSIS_INTERVAL_NS 33000000ULL
 
 /* 角度推定のゲインと上限 (rad)。最終調整で詰める前提の初期値 */
 #define HAL_YAW_GAIN 2.2f
@@ -94,6 +97,10 @@ struct hal_visor_data {
 	/* ステップ7: 診断ログのスロットル用 */
 	uint64_t last_diag_ns;
 	uint64_t last_warp_log_ns;
+	/* ステップ11: 解析パスの時間スロットルと、
+	 * 診断ログ用の描画回数カウンタ (前回ログからの呼び出し回数) */
+	uint64_t last_analysis_ns;
+	uint32_t diag_render_calls;
 
 	/* ワーカースレッドと受け渡しスロット */
 	struct hv_frame_slot frame;
@@ -332,7 +339,7 @@ static void estimate_angles(struct hal_visor_data *filter, float strength,
 }
 
 /*
- * 最新の検出結果を取り込んで平滑化する (描画スレッド)。
+ * 最新の検出結果を取り込んで平滑化する (video_tick から呼ばれる)。
  * 新しい結果が来た時だけ EMA を1回適用する。見失ったら変換は保持し、
  * 次に検出した時はスナップ (補間しない) する。
  */
@@ -406,6 +413,21 @@ static void consume_results(struct hal_visor_data *filter)
 			     (double)(epitch * 57.29578f));
 		}
 	}
+}
+
+/*
+ * ステップ11: 追従状態の更新を描画から分離する。
+ * 検出結果の取り込みと平滑化は video_tick (グラフィクスフレームに
+ * 1回だけ呼ばれる) で行い、video_render は sm_* を読むだけにする。
+ * 設定ダイアログのプレビューなど別の描画文脈から video_render が
+ * 呼ばれても、状態が二重に進んで映像が揺れることはなくなる。
+ */
+static void hal_visor_video_tick(void *data, float seconds)
+{
+	UNUSED_PARAMETER(seconds);
+	struct hal_visor_data *filter = data;
+
+	consume_results(filter);
 }
 
 static void hal_visor_update(void *data, obs_data_t *settings)
@@ -799,6 +821,7 @@ static void hal_visor_video_render(void *data, gs_effect_t *effect)
 	 * ダイアログ表示中の揺れが起きていた)。
 	 */
 	filter->frame_count++;
+	filter->diag_render_calls++;
 
 	// 検出器の用意はマップの外で行う (セッション生成は重い処理なので)
 	ensure_detector(filter);
@@ -809,52 +832,71 @@ static void hal_visor_video_render(void *data, gs_effect_t *effect)
 	if (cx && cy)
 		ensure_capture(filter, cx, cy);
 
-	// 前回コピーしたフレームをマップしてワーカーへ渡す
-	if (filter->stage_pending && filter->stage) {
-		uint8_t *pixels = NULL;
-		uint32_t linesize = 0;
-		if (gs_stagesurface_map(filter->stage, &pixels, &linesize) &&
-		    pixels) {
-			if (filter->detector)
-				publish_frame(filter, pixels, (int)cx, (int)cy,
-					      (int)linesize);
-			gs_stagesurface_unmap(filter->stage);
-		}
-		filter->stage_pending = false;
-	}
+	/*
+	 * ステップ11: 解析パス全体に時間スロットルを入れる (約33msに
+	 * 1回まで)。キャプチャは従来通り「3回に1回」との併用で、両方を
+	 * 満たした時だけ走る。設定ダイアログのプレビューなど別の描画
+	 * 文脈から video_render が呼ばれても、キャプチャや発行の頻度が
+	 * 倍増したり stage surface を奪い合ったりしないようにするため。
+	 */
+	uint64_t render_now = os_gettime_ns();
+	if (render_now - filter->last_analysis_ns >=
+	    HAL_ANALYSIS_INTERVAL_NS) {
+		filter->last_analysis_ns = render_now;
 
-	// 解析パス: 3回に1回、検出用に親ソースを自前 texrender へ描き、
-	// stage surface へコピーする (次回マップする)。出力には描かない
-	if (cx && cy && filter->capture && filter->stage &&
-	    (filter->frame_count % 3) == 0) {
-		bool staged = false;
-		gs_texrender_reset(filter->capture);
-		if (gs_texrender_begin(filter->capture, cx, cy)) {
-			struct vec4 clear_color;
-			vec4_set(&clear_color, 0.0f, 0.0f, 0.0f, 0.0f);
-			gs_clear(GS_CLEAR_COLOR, &clear_color, 0.0f, 0);
-			// 親ソースを自前 texrender へ描く
-			if (obs_source_process_filter_begin(
-				    filter->source, GS_RGBA,
-				    OBS_NO_DIRECT_RENDERING)) {
-				obs_source_process_filter_end(
-					filter->source,
-					obs_get_base_effect(OBS_EFFECT_DEFAULT),
-					(int)cx, (int)cy);
-				staged = true;
+		// 前回コピーしたフレームをマップしてワーカーへ渡す
+		if (filter->stage_pending && filter->stage) {
+			uint8_t *pixels = NULL;
+			uint32_t linesize = 0;
+			if (gs_stagesurface_map(filter->stage, &pixels,
+						&linesize) &&
+			    pixels) {
+				if (filter->detector)
+					publish_frame(filter, pixels, (int)cx,
+						      (int)cy,
+						      (int)linesize);
+				gs_stagesurface_unmap(filter->stage);
 			}
-			gs_texrender_end(filter->capture);
+			filter->stage_pending = false;
 		}
-		if (staged) {
-			gs_stage_texture(filter->stage,
-					 gs_texrender_get_texture(
-						 filter->capture));
-			filter->stage_pending = true;
+
+		// 解析パス: 3回に1回、検出用に親ソースを自前 texrender
+		// へ描き、stage surface へコピーする (次回マップする)。
+		// 出力には描かない
+		if (cx && cy && filter->capture && filter->stage &&
+		    (filter->frame_count % 3) == 0) {
+			bool staged = false;
+			gs_texrender_reset(filter->capture);
+			if (gs_texrender_begin(filter->capture, cx, cy)) {
+				struct vec4 clear_color;
+				vec4_set(&clear_color, 0.0f, 0.0f, 0.0f,
+					 0.0f);
+				gs_clear(GS_CLEAR_COLOR, &clear_color, 0.0f,
+					 0);
+				// 親ソースを自前 texrender へ描く
+				if (obs_source_process_filter_begin(
+					    filter->source, GS_RGBA,
+					    OBS_NO_DIRECT_RENDERING)) {
+					obs_source_process_filter_end(
+						filter->source,
+						obs_get_base_effect(
+							OBS_EFFECT_DEFAULT),
+						(int)cx, (int)cy);
+					staged = true;
+				}
+				gs_texrender_end(filter->capture);
+			}
+			if (staged) {
+				gs_stage_texture(
+					filter->stage,
+					gs_texrender_get_texture(
+						filter->capture));
+				filter->stage_pending = true;
+			}
 		}
 	}
 
-	// 最新の検出結果を取り込んで平滑化する
-	consume_results(filter);
+	// (検出結果の取り込みと平滑化はステップ11で video_tick へ移動)
 
 	// 出力パス: OBS 標準の手順でフィルター出力を作る。
 	// 出力テクスチャとそのサイズは OBS 側が管理する
@@ -918,13 +960,14 @@ static void hal_visor_video_render(void *data, gs_effect_t *effect)
 		if (now - filter->last_diag_ns >= 1000000000ULL) {
 			filter->last_diag_ns = now;
 			blog(LOG_INFO,
-			     "[hal-visor] 診断: render: loaded=%d texture=%s サイズ=%ux%u have_track=%d tracking=%d 描画分岐=%s 出力分岐=%s 出力サイズ=%ux%u",
+			     "[hal-visor] 診断: render: loaded=%d texture=%s サイズ=%ux%u have_track=%d tracking=%d 描画分岐=%s 出力分岐=%s 出力サイズ=%ux%u 描画回数/秒=%u",
 			     filter->image.loaded ? 1 : 0,
 			     filter->image.texture ? "あり" : "なし",
 			     filter->image.cx, filter->image.cy,
 			     filter->have_track ? 1 : 0,
 			     filter->tracking ? 1 : 0, diag_branch, out_branch,
-			     cx, cy);
+			     cx, cy, filter->diag_render_calls);
+			filter->diag_render_calls = 0;
 		}
 	}
 }
@@ -1039,6 +1082,7 @@ struct obs_source_info hal_visor_filter_info = {
 	.get_defaults = hal_visor_defaults,
 	.get_properties = hal_visor_properties,
 	.video_render = hal_visor_video_render,
+	.video_tick = hal_visor_video_tick,
 };
 
 bool obs_module_load(void)
