@@ -483,15 +483,25 @@ bool hal_face_detector_infer(struct hal_face_detector *det,
 					if (ncand >= HAL_MAX_CAND)
 						continue;
 					struct hal_cand *c = &cands[ncand++];
-					float l = view_at(&views[2], gy, gx, 0);
-					float t = view_at(&views[2], gy, gx, 1);
-					float r = view_at(&views[2], gy, gx, 2);
-					float b = view_at(&views[2], gy, gx, 3);
+					float b0 = view_at(&views[2], gy, gx, 0);
+					float b1 = view_at(&views[2], gy, gx, 1);
+					float b2 = view_at(&views[2], gy, gx, 2);
+					float b3 = view_at(&views[2], gy, gx, 3);
+					/* ステップ14: YuNet の bbox 出力は
+					 * (l, t, r, b) の距離ではなく、中心の
+					 * オフセット + 対数サイズ (同一テンソル
+					 * に対する OpenCV の結果と一致すること
+					 * を数値検証済み)。中心と実サイズに
+					 * 戻してから両端を求める */
+					float bcx = (gx + b0) * stride;
+					float bcy = (gy + b1) * stride;
+					float bw = expf(b2) * stride;
+					float bh = expf(b3) * stride;
 					c->score = score;
-					c->x0 = (gx - l) * stride;
-					c->y0 = (gy - t) * stride;
-					c->x1 = (gx + r) * stride;
-					c->y1 = (gy + b) * stride;
+					c->x0 = bcx - bw * 0.5f;
+					c->y0 = bcy - bh * 0.5f;
+					c->x1 = bcx + bw * 0.5f;
+					c->y1 = bcy + bh * 0.5f;
 					for (int k = 0; k < 5; k++) {
 						c->kps[2 * k] =
 							(gx + view_at(&views[3],

@@ -1124,6 +1124,17 @@ static void hal_visor_video_render(void *data, gs_effect_t *effect)
 					 0.0f);
 				gs_clear(GS_CLEAR_COLOR, &clear_color, 0.0f,
 					 0);
+				// ステップ14: process_filter_end の描画は
+				// 現在のモデルビュー行列を使うため、
+				// video_render の呼び出し側 (シーン/ダイア
+				// ログ) の変換が残っていると、キャプチャ
+				// 画像がソース本来の座標系からずれて
+				// 縮小・移動してしまう (ステップ12のダンプ
+				// で実証)。解析パスでは単位行列に固定して
+				// から描く。出力パス側は触らない (あちらの
+				// 呼び出し側設定がフィルターの正規の契約)
+				gs_matrix_push();
+				gs_matrix_identity();
 				// 親ソースを自前 texrender へ描く
 				if (obs_source_process_filter_begin(
 					    filter->source, GS_RGBA,
@@ -1135,6 +1146,7 @@ static void hal_visor_video_render(void *data, gs_effect_t *effect)
 						(int)cx, (int)cy);
 					staged = true;
 				}
+				gs_matrix_pop();
 				gs_texrender_end(filter->capture);
 			}
 			if (staged) {
