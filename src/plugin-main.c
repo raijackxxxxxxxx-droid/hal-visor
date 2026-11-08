@@ -87,6 +87,9 @@ struct hal_visor_data {
 	bool stage_pending;
 	uint32_t frame_count;
 	uint64_t last_log_ns;
+	/* ステップ7: 診断ログのスロットル用 */
+	uint64_t last_diag_ns;
+	uint64_t last_warp_log_ns;
 
 	/* ワーカースレッドと受け渡しスロット */
 	struct hv_frame_slot frame;
@@ -419,6 +422,15 @@ static void hal_visor_update(void *data, obs_data_t *settings)
 
 	// 画像パスの更新
 	if (!filter->image_path || strcmp(filter->image_path, path) != 0) {
+		blog(LOG_INFO,
+		     "[hal-visor] 診断: update で画像パスを受信: '%s'",
+		     path ? path : "(null)");
+		if (filter->image_path && filter->image_path[0] &&
+		    (!path || !path[0])) {
+			blog(LOG_INFO,
+			     "[hal-visor] 診断: 画像パスが空に戻されました (前回: '%s')",
+			     filter->image_path);
+		}
 		bfree(filter->image_path);
 		filter->image_path = bstrdup(path);
 
@@ -427,6 +439,11 @@ static void hal_visor_update(void *data, obs_data_t *settings)
 		if (path && *path) {
 			gs_image_file_init(&filter->image, path);
 		}
+		blog(LOG_INFO,
+		     "[hal-visor] 診断: 画像読み込み結果: loaded=%d texture=%s サイズ=%ux%u",
+		     filter->image.loaded ? 1 : 0,
+		     filter->image.texture ? "あり" : "なし",
+		     filter->image.cx, filter->image.cy);
 		obs_leave_graphics();
 	}
 }
@@ -485,6 +502,8 @@ static void *hal_visor_create(obs_data_t *settings, obs_source_t *source)
 		bmalloc(sizeof(float) * filter->frame_buf_cap);
 
 	worker_start(filter);
+	blog(LOG_INFO, "[hal-visor] 診断: create 初期画像パス: '%s'",
+	     obs_data_get_string(settings, "image_path"));
 	hal_visor_update(filter, settings);
 	return filter;
 }
@@ -632,8 +651,25 @@ static bool draw_visor_warped(struct hal_visor_data *filter, float center_x,
 			      float center_y, float w, float h,
 			      float roll_rad, float yaw, float pitch)
 {
-	if (w <= 0.0f || h <= 0.0f || !ensure_quad_vb(filter))
+	if (w <= 0.0f || h <= 0.0f) {
+		uint64_t now = os_gettime_ns();
+		if (now - filter->last_warp_log_ns >= 1000000000ULL) {
+			filter->last_warp_log_ns = now;
+			blog(LOG_INFO,
+			     "[hal-visor] 診断: draw_visor_warped 中止: サイズ不正 w=%.1f h=%.1f",
+			     (double)w, (double)h);
+		}
 		return false;
+	}
+	if (!ensure_quad_vb(filter)) {
+		uint64_t now = os_gettime_ns();
+		if (now - filter->last_warp_log_ns >= 1000000000ULL) {
+			filter->last_warp_log_ns = now;
+			blog(LOG_INFO,
+			     "[hal-visor] 診断: draw_visor_warped 中止: 頂点バッファ確保に失敗");
+		}
+		return false;
+	}
 
 	const float lx[4] = {-0.5f, 0.5f, -0.5f, 0.5f}; /* TL, TR, BL, BR */
 	const float ly[4] = {-0.5f, -0.5f, 0.5f, 0.5f};
@@ -693,8 +729,15 @@ static bool draw_visor_warped(struct hal_visor_data *filter, float center_x,
 	}
 
 	struct gs_vb_data *data = gs_vertexbuffer_get_data(filter->quad_vb);
-	if (!data)
+	if (!data) {
+		uint64_t now = os_gettime_ns();
+		if (now - filter->last_warp_log_ns >= 1000000000ULL) {
+			filter->last_warp_log_ns = now;
+			blog(LOG_INFO,
+			     "[hal-visor] 診断: draw_visor_warped 中止: 頂点データを取得できませんでした");
+		}
 		return false;
+	}
 	for (int i = 0; i < 4; i++)
 		vec3_set(data->points + i, px[i], py[i], 0.0f);
 	gs_vertexbuffer_flush(filter->quad_vb);
@@ -816,6 +859,7 @@ static void hal_visor_video_render(void *data, gs_effect_t *effect)
 	consume_results(filter);
 
 	// バイザー画像を描画
+	const char *diag_branch = "not-drawn-because-image";
 	if (filter->image.loaded && filter->image.texture) {
 		if (filter->tracking && filter->have_track &&
 		    filter->sm_dist > 0.0f) {
@@ -844,11 +888,29 @@ static void hal_visor_video_render(void *data, gs_effect_t *effect)
 				draw_visor_image(filter, filter->sm_x,
 						 filter->sm_y, ts, ang);
 			}
+			diag_branch = drawn ? "tracked-warped"
+					    : "tracked-sprite";
 		} else {
 			// 従来のスライダー位置
 			float s = (float)filter->scale / 100.0f;
 			draw_visor_image(filter, (float)filter->pos_x,
 					 (float)filter->pos_y, s, 0.0f);
+			diag_branch = "slider-sprite";
+		}
+	}
+
+	// ステップ7: 描画状態の診断ログ (1秒に1回)
+	{
+		uint64_t now = os_gettime_ns();
+		if (now - filter->last_diag_ns >= 1000000000ULL) {
+			filter->last_diag_ns = now;
+			blog(LOG_INFO,
+			     "[hal-visor] 診断: render: loaded=%d texture=%s サイズ=%ux%u have_track=%d tracking=%d 描画分岐=%s",
+			     filter->image.loaded ? 1 : 0,
+			     filter->image.texture ? "あり" : "なし",
+			     filter->image.cx, filter->image.cy,
+			     filter->have_track ? 1 : 0,
+			     filter->tracking ? 1 : 0, diag_branch);
 		}
 	}
 }
