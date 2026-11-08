@@ -68,6 +68,10 @@ struct hal_visor_data {
 	double width_factor;
 	/* ステップ4: 変形の強さ (%) */
 	int deform;
+	/* ステップ10: 追従時の微調整 (px / %) */
+	int adj_x;
+	int adj_y;
+	int adj_scale;
 	/* 正面登録 (フィルター設定に永続化される) */
 	bool calib_valid;
 	double calib_eye_dist;
@@ -415,6 +419,9 @@ static void hal_visor_update(void *data, obs_data_t *settings)
 	filter->tracking = obs_data_get_bool(settings, "tracking");
 	filter->width_factor = obs_data_get_double(settings, "width_factor");
 	filter->deform = (int)obs_data_get_int(settings, "deform");
+	filter->adj_x = (int)obs_data_get_int(settings, "adj_x");
+	filter->adj_y = (int)obs_data_get_int(settings, "adj_y");
+	filter->adj_scale = (int)obs_data_get_int(settings, "adj_scale");
 	filter->calib_valid = obs_data_get_bool(settings, "calib_valid");
 	filter->calib_eye_dist = obs_data_get_double(settings, "calib_eye_dist");
 	filter->calib_nose_nx = obs_data_get_double(settings, "calib_nose_nx");
@@ -869,6 +876,10 @@ static void hal_visor_video_render(void *data, gs_effect_t *effect)
 			// 追従: 平滑化済みの目位置・間隔・角度で1回だけ描く。
 			// 検出が途切れても最後の変換を保持する (隠し続ける)。
 			float ang = atan2f(filter->sm_sin, filter->sm_cos);
+			// ステップ10: 追従位置・大きさの微調整
+			float dcx = filter->sm_x + (float)filter->adj_x;
+			float dcy = filter->sm_y + (float)filter->adj_y;
+			float asf = (float)filter->adj_scale / 100.0f;
 			bool drawn = false;
 			if (filter->calib_valid && filter->deform > 0) {
 				// 正面登録があれば、顔の向きで変形して描く
@@ -877,19 +888,18 @@ static void hal_visor_video_render(void *data, gs_effect_t *effect)
 						(float)filter->deform / 100.0f,
 						&yaw, &pitch);
 				float w = (float)((double)filter->sm_dist *
-						  filter->width_factor);
+						  filter->width_factor) *
+					  asf;
 				float h = w * (float)filter->image.cy /
 					  (float)filter->image.cx;
-				drawn = draw_visor_warped(filter, filter->sm_x,
-							  filter->sm_y, w, h,
+				drawn = draw_visor_warped(filter, dcx, dcy, w, h,
 							  ang, yaw, pitch);
 			}
 			if (!drawn) {
 				float ts = (float)((double)filter->sm_dist *
 						   filter->width_factor) /
-					   (float)filter->image.cx;
-				draw_visor_image(filter, filter->sm_x,
-						 filter->sm_y, ts, ang);
+					   (float)filter->image.cx * asf;
+				draw_visor_image(filter, dcx, dcy, ts, ang);
 			}
 			diag_branch = drawn ? "tracked-warped"
 					    : "tracked-sprite";
@@ -990,6 +1000,12 @@ static obs_properties_t *hal_visor_properties(void *data)
 	obs_properties_add_bool(props, "tracking", "顔追従");
 	obs_properties_add_float_slider(props, "width_factor", "幅の倍率",
 					1.0, 6.0, 0.1);
+	obs_properties_add_int_slider(props, "adj_x", "位置の微調整 X", -400,
+				      400, 1);
+	obs_properties_add_int_slider(props, "adj_y", "位置の微調整 Y", -400,
+				      400, 1);
+	obs_properties_add_int_slider(props, "adj_scale", "大きさの微調整 (%)",
+				      50, 200, 1);
 	obs_properties_add_int_slider(props, "deform", "変形の強さ", 0, 200,
 				      1);
 	obs_properties_add_button2(props, "calib_button", "正面を登録",
@@ -1005,6 +1021,9 @@ static void hal_visor_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "scale", 100);
 	obs_data_set_default_bool(settings, "tracking", true);
 	obs_data_set_default_double(settings, "width_factor", 3.0);
+	obs_data_set_default_int(settings, "adj_x", 0);
+	obs_data_set_default_int(settings, "adj_y", 0);
+	obs_data_set_default_int(settings, "adj_scale", 100);
 	obs_data_set_default_int(settings, "deform", 100);
 	obs_data_set_default_bool(settings, "calib_valid", false);
 }
