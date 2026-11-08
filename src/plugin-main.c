@@ -167,8 +167,8 @@ static void hv_unlock(struct hal_visor_data *filter)
  * 解析対象フレームそのものと、モデル入力へ変換した結果を目で見るための
  * 診断専用コード。検出・描画の挙動には一切影響しない。
  * BMP は外部ライブラリを使わず、ヘッダを手書きで fwrite する。
- * 書き出し先はユーザーのデスクトップ (パスは UTF-8 で保持し、
- * Windows ではワイド文字へ変換して開く) */
+ * 書き出し先はデスクトップ → プロファイル直下 → %TEMP% の順に試す
+ * (パスは UTF-8 で保持し、Windows ではワイド文字へ変換して開く) */
 
 static void hv_put_u16le(FILE *f, uint16_t v)
 {
@@ -282,50 +282,74 @@ static bool hv_write_bmp24_float_rgb(const char *path, const float *plane_r,
 	return ok;
 }
 
-/* デスクトップ上のファイルパス (UTF-8) を組み立てる */
-static void hv_desktop_file_path(char *dst, size_t dst_size,
-				 const char *filename)
+/* ダンプ先ディレクトリ候補のファイルパス (UTF-8) を組み立てる。
+ * idx: 0 = %USERPROFILE%\Desktop、1 = %USERPROFILE% 自体、2 = %TEMP%。
+ * ベースの環境変数が無い場合は false (その候補は使えない)。
+ * ステップ12ではデスクトップ固定だったため、デスクトップが
+ * リダイレクトされていて実在しない環境で全て失敗した。その教訓で
+ * ステップ13から候補を順に試すフォールバックにした */
+static bool hv_dump_file_path(char *dst, size_t dst_size, int idx,
+			      const char *filename)
 {
 #ifdef _WIN32
-	const wchar_t *home = _wgetenv(L"USERPROFILE");
+	const wchar_t *base = NULL;
+	if (idx == 0 || idx == 1)
+		base = _wgetenv(L"USERPROFILE");
+	else if (idx == 2)
+		base = _wgetenv(L"TEMP");
+	if (!base || !base[0])
+		return false;
 	wchar_t wname[128];
 	wchar_t wpath[1024];
-	if (!home || !home[0])
-		home = L"C:\\Users\\Public";
 	if (MultiByteToWideChar(CP_ACP, 0, filename, -1, wname,
 				(int)(sizeof(wname) / sizeof(wname[0]))) <= 0)
-		wname[0] = 0;
-	_snwprintf(wpath, sizeof(wpath) / sizeof(wpath[0]),
-		   L"%s\\Desktop\\%s", home, wname);
-	wpath[(sizeof(wpath) / sizeof(wpath[0])) - 1] = 0;
-	if (WideCharToMultiByte(CP_UTF8, 0, wpath, -1, dst, (int)dst_size,
-				NULL, NULL) <= 0)
-		snprintf(dst, dst_size, "%s", filename);
-#else
-	const char *home = getenv("USERPROFILE");
-	if (home && home[0])
-		snprintf(dst, dst_size, "%s\\Desktop\\%s", home, filename);
+		return false;
+	if (idx == 0)
+		_snwprintf(wpath, sizeof(wpath) / sizeof(wpath[0]),
+			   L"%s\\Desktop\\%s", base, wname);
 	else
-		snprintf(dst, dst_size, "C:\\Users\\Public\\Desktop\\%s",
-			 filename);
+		_snwprintf(wpath, sizeof(wpath) / sizeof(wpath[0]),
+			   L"%s\\%s", base, wname);
+	wpath[(sizeof(wpath) / sizeof(wpath[0])) - 1] = 0;
+	return WideCharToMultiByte(CP_UTF8, 0, wpath, -1, dst,
+				   (int)dst_size, NULL, NULL) > 0;
+#else
+	const char *base = NULL;
+	if (idx == 0 || idx == 1)
+		base = getenv("USERPROFILE");
+	else if (idx == 2)
+		base = getenv("TEMP");
+	if (!base || !base[0])
+		return false;
+	if (idx == 0)
+		snprintf(dst, dst_size, "%s\\Desktop\\%s", base, filename);
+	else
+		snprintf(dst, dst_size, "%s\\%s", base, filename);
+	return true;
 #endif
 }
 
 /*
  * マップ済みステージフレーム (publish_frame へ渡す直前のピクセルそのもの)
- * と、それを prepare したモデル入力をデスクトップへ BMP で書き出す。
+ * と、それを prepare したモデル入力を BMP で書き出す。書き出し先は
+ * ファイルごとに デスクトップ → プロファイル直下 → %TEMP% の順に試し、
+ * 成功したパスをそのままログへ残す (全て失敗なら最後に試したパスと
+ * 「失敗」が残る)。
  */
 static void hv_dump_staged_frame(struct hal_visor_data *filter,
 				 const uint8_t *pixels, int w, int h,
 				 int linesize)
 {
-	char cap_path[1024];
-	char in_path[1024];
-	hv_desktop_file_path(cap_path, sizeof(cap_path),
-			     "hal-visor-capture.bmp");
-	hv_desktop_file_path(in_path, sizeof(in_path), "hal-visor-input.bmp");
+	char cap_path[1024] = "";
+	char in_path[1024] = "";
 
-	bool cap_ok = hv_write_bmp32_bgra(cap_path, pixels, w, h, linesize);
+	bool cap_ok = false;
+	for (int d = 0; d < 3 && !cap_ok; d++) {
+		if (!hv_dump_file_path(cap_path, sizeof(cap_path), d,
+				       "hal-visor-capture.bmp"))
+			continue;
+		cap_ok = hv_write_bmp32_bgra(cap_path, pixels, w, h, linesize);
+	}
 
 	bool in_ok = false;
 	int in_w = 0, in_h = 0;
@@ -340,9 +364,16 @@ static void hv_dump_staged_frame(struct hal_visor_data *filter,
 				/* prepare の出力は BGR の CHW (面0=B, 面1=G,
 				 * 面2=R)。RGB の面として正しく渡す */
 				size_t plane = (size_t)in_w * (size_t)in_h;
-				in_ok = hv_write_bmp24_float_rgb(
-					in_path, scratch + 2 * plane,
-					scratch + plane, scratch, in_w, in_h);
+				for (int d = 0; d < 3 && !in_ok; d++) {
+					if (!hv_dump_file_path(
+						    in_path, sizeof(in_path), d,
+						    "hal-visor-input.bmp"))
+						continue;
+					in_ok = hv_write_bmp24_float_rgb(
+						in_path, scratch + 2 * plane,
+						scratch + plane, scratch, in_w,
+						in_h);
+				}
 			}
 			bfree(scratch);
 		}
@@ -594,8 +625,9 @@ static void consume_results(struct hal_visor_data *filter)
 	if (now - filter->last_log_ns >= 1000000000ULL) {
 		filter->last_log_ns = now;
 		blog(LOG_INFO,
-		     "[hal-visor] 顔検出: score=%.2f 目の中心=(%.0f, %.0f) 目の間隔=%.0f",
-		     res.score, res.eye_mid_x, res.eye_mid_y, res.eye_dist);
+		     "[hal-visor] 顔検出: score=%.2f 目の中心=(%.0f, %.0f) 目の間隔=%.0f 顔ボックス=(%.0f, %.0f, %.0f, %.0f)",
+		     res.score, res.eye_mid_x, res.eye_mid_y, res.eye_dist,
+		     res.box_x, res.box_y, res.box_w, res.box_h);
 		if (filter->calib_valid) {
 			double cnx = (double)(res.nose_x - res.eye_mid_x) /
 				     (double)res.eye_dist;
