@@ -119,6 +119,13 @@ struct hal_visor_data {
 	bool dump_next_frame;
 	bool auto_dump_done;
 	uint64_t create_ns;
+	/* ステップ16: 出力フレームダンプ診断。
+	 * output_dump_armed はステージダンプと同時に立ち、その回の
+	 * 出力パス後に実出力の複製を stage へ載せる予約。
+	 * output_dump_pending は stage に出力複製が載っていて、次の
+	 * マップ機会に hal-visor-output.bmp として書き出す待ち状態 */
+	bool output_dump_armed;
+	bool output_dump_pending;
 
 	/* ワーカースレッドと受け渡しスロット */
 	struct hv_frame_slot frame;
@@ -393,6 +400,27 @@ static void hv_dump_staged_frame(struct hal_visor_data *filter,
 	     "[hal-visor] 診断: フレームダンプ capture='%s' (%s) input='%s' (%s) ステージフレーム=%dx%d linesize=%d モデル入力=%dx%d",
 	     cap_path, cap_ok ? "OK" : "失敗", in_path,
 	     in_ok ? "OK" : "失敗", w, h, linesize, in_w, in_h);
+}
+
+/*
+ * ステップ16: 出力複製 (stage に載った実出力そのもの) を
+ * hal-visor-output.bmp として書き出す。書き出し先のフォールバックは
+ * 他のダンプと同じ (デスクトップ → プロファイル直下 → %TEMP%)。
+ */
+static void hv_dump_output_frame(const uint8_t *pixels, int w, int h,
+				 int linesize)
+{
+	char out_path[1024] = "";
+	bool ok = false;
+	for (int d = 0; d < 3 && !ok; d++) {
+		if (!hv_dump_file_path(out_path, sizeof(out_path), d,
+				       "hal-visor-output.bmp"))
+			continue;
+		ok = hv_write_bmp32_bgra(out_path, pixels, w, h, linesize);
+	}
+	blog(LOG_INFO,
+	     "[hal-visor] 診断: 出力ダンプ output='%s' (%s) ステージフレーム=%dx%d linesize=%d",
+	     out_path, ok ? "OK" : "失敗", w, h, linesize);
 }
 
 /* ---- ワーカースレッド: スロットのフレームを取り出して推論し、結果を返す ---- */
@@ -744,6 +772,9 @@ static void free_capture(struct hal_visor_data *filter)
 		filter->capture = NULL;
 	}
 	filter->stage_pending = false;
+	/* ステップ16: stage を失ったら出力ダンプの予約・待ちも無効になる */
+	filter->output_dump_armed = false;
+	filter->output_dump_pending = false;
 	filter->stage_w = 0;
 	filter->stage_h = 0;
 }
@@ -1053,6 +1084,126 @@ static bool draw_visor_warped(struct hal_visor_data *filter, float center_x,
 	return true;
 }
 
+/*
+ * バイザー画像を現在の出力の上に重ねて描く共通処理 (ステップ16で
+ * 切り出し)。実出力と出力ダンプの複製で同じパラメータ・同じ手順の
+ * 描画を保証するため、video_render の出力パスと
+ * hv_render_output_dump の両方から呼ぶ。戻り値は描画分岐名。
+ * draw_cx/draw_cy/draw_w が非 NULL なら、実際に使った描画中心と
+ * 描画幅 (px) を返す (診断ログ用)。
+ */
+static const char *hv_draw_overlay(struct hal_visor_data *filter,
+				   float *draw_cx, float *draw_cy,
+				   float *draw_w)
+{
+	if (filter->tracking && filter->have_track &&
+	    filter->sm_dist > 0.0f) {
+		// 追従: 平滑化済みの目位置・間隔・角度で1回だけ描く。
+		// 検出が途切れても最後の変換を保持する (隠し続ける)。
+		float ang = atan2f(filter->sm_sin, filter->sm_cos);
+		// ステップ10: 追従位置・大きさの微調整
+		float dcx = filter->sm_x + (float)filter->adj_x;
+		float dcy = filter->sm_y + (float)filter->adj_y;
+		float asf = (float)filter->adj_scale / 100.0f;
+		// ステップ15: 横顔では目の間隔が潰れて幅まで潰れるため、
+		// 幅の基準は顔ボックス幅からも見積もって大きい方を使う
+		float eff_dist = filter->sm_dist;
+		float box_dist = filter->sm_box_w * HAL_BOX_DIST_RATIO;
+		if (box_dist > eff_dist)
+			eff_dist = box_dist;
+		bool drawn = false;
+		float used_w = 0.0f;
+		if (filter->calib_valid && filter->deform > 0) {
+			// 正面登録があれば、顔の向きで変形して描く
+			float yaw = 0.0f, pitch = 0.0f;
+			estimate_angles(filter,
+					(float)filter->deform / 100.0f, &yaw,
+					&pitch);
+			// ステップ15: 描画に使う角度だけ上限を絞る
+			// (ログの角度推定は生の推定値のまま)
+			yaw = hv_clampf(yaw, -HAL_DRAW_YAW_MAX,
+					HAL_DRAW_YAW_MAX);
+			pitch = hv_clampf(pitch, -HAL_DRAW_PITCH_MAX,
+					  HAL_DRAW_PITCH_MAX);
+			float w = (float)((double)eff_dist *
+					  filter->width_factor) *
+				  asf;
+			float h = w * (float)filter->image.cy /
+				  (float)filter->image.cx;
+			drawn = draw_visor_warped(filter, dcx, dcy, w, h,
+						  ang, yaw, pitch);
+			if (drawn)
+				used_w = w;
+		}
+		if (!drawn) {
+			float ts = (float)((double)eff_dist *
+					   filter->width_factor) /
+				   (float)filter->image.cx * asf;
+			draw_visor_image(filter, dcx, dcy, ts, ang);
+			used_w = (float)filter->image.cx * ts;
+		}
+		if (draw_cx)
+			*draw_cx = dcx;
+		if (draw_cy)
+			*draw_cy = dcy;
+		if (draw_w)
+			*draw_w = used_w;
+		return drawn ? "tracked-warped" : "tracked-sprite";
+	}
+
+	// 従来のスライダー位置
+	float s = (float)filter->scale / 100.0f;
+	draw_visor_image(filter, (float)filter->pos_x,
+			 (float)filter->pos_y, s, 0.0f);
+	if (draw_cx)
+		*draw_cx = (float)filter->pos_x;
+	if (draw_cy)
+		*draw_cy = (float)filter->pos_y;
+	if (draw_w)
+		*draw_w = (float)filter->image.cx * s;
+	return "slider-sprite";
+}
+
+/*
+ * ステップ16: 出力ダンプ用の複製レンダリング。この回の実出力と
+ * 同じ手順 (process_filter_begin/end + hv_draw_overlay) を自前
+ * texrender へ描き直し、stage surface へ載せる。書き出しは次の
+ * 解析パスのマップ機会 (hv_dump_output_frame) が行う。
+ * texrender へ描く際の座標系はステップ14と同じ理由で単位行列に
+ * 固定する (呼び出し側の変換を持ち込むと複製がソース本来の
+ * 座標系からずれて、測定に使えなくなるため)。
+ */
+static void hv_render_output_dump(struct hal_visor_data *filter,
+				  gs_effect_t *effect, uint32_t cx,
+				  uint32_t cy)
+{
+	gs_texrender_reset(filter->capture);
+	if (!gs_texrender_begin(filter->capture, cx, cy))
+		return;
+	struct vec4 clear_color;
+	vec4_set(&clear_color, 0.0f, 0.0f, 0.0f, 0.0f);
+	gs_clear(GS_CLEAR_COLOR, &clear_color, 0.0f, 0);
+	gs_matrix_push();
+	gs_matrix_identity();
+	bool staged = false;
+	if (obs_source_process_filter_begin(filter->source, GS_RGBA,
+					    OBS_NO_DIRECT_RENDERING)) {
+		obs_source_process_filter_end(filter->source, effect, (int)cx,
+					      (int)cy);
+		if (filter->image.loaded && filter->image.texture)
+			hv_draw_overlay(filter, NULL, NULL, NULL);
+		staged = true;
+	}
+	gs_matrix_pop();
+	gs_texrender_end(filter->capture);
+	if (staged) {
+		gs_stage_texture(filter->stage,
+				 gs_texrender_get_texture(filter->capture));
+		filter->stage_pending = true;
+		filter->output_dump_pending = true;
+	}
+}
+
 static void hal_visor_video_render(void *data, gs_effect_t *effect)
 {
 	struct hal_visor_data *filter = data;
@@ -1105,20 +1256,39 @@ static void hal_visor_video_render(void *data, gs_effect_t *effect)
 			if (gs_stagesurface_map(filter->stage, &pixels,
 						&linesize) &&
 			    pixels) {
-				/* ステップ12: ダンプ指定があれば、
-				 * publish_frame へ渡す直前のピクセル
-				 * そのものを BMP に書き出す */
-				if (filter->dump_next_frame) {
-					filter->dump_next_frame = false;
-					hv_dump_staged_frame(filter, pixels,
-							     (int)cx, (int)cy,
+				/* ステップ16: stage に出力複製が載っている
+				 * 場合は、それを出力ダンプとして書き出す。
+				 * 解析フレームではないのでワーカーへは
+				 * 渡さない */
+				if (filter->output_dump_pending) {
+					filter->output_dump_pending = false;
+					hv_dump_output_frame(pixels, (int)cx,
+							     (int)cy,
 							     (int)linesize);
+				} else {
+					/* ステップ12: ダンプ指定があれば、
+					 * publish_frame へ渡す直前のピクセル
+					 * そのものを BMP に書き出す */
+					if (filter->dump_next_frame) {
+						filter->dump_next_frame = false;
+						/* ステップ16: 出力ダンプも
+						 * 同じタイミングで予約する */
+						filter->output_dump_armed = true;
+						hv_dump_staged_frame(
+							filter, pixels, (int)cx,
+							(int)cy, (int)linesize);
+					}
+					if (filter->detector)
+						publish_frame(filter, pixels,
+							      (int)cx, (int)cy,
+							      (int)linesize);
 				}
-				if (filter->detector)
-					publish_frame(filter, pixels, (int)cx,
-						      (int)cy,
-						      (int)linesize);
 				gs_stagesurface_unmap(filter->stage);
+			} else if (filter->output_dump_pending) {
+				/* マップできなかった出力複製は取りこぼす
+				 * (次に stage される解析フレームを出力ダンプと
+				 * 誤認しないため) */
+				filter->output_dump_pending = false;
 			}
 			filter->stage_pending = false;
 		}
@@ -1185,60 +1355,25 @@ static void hal_visor_video_render(void *data, gs_effect_t *effect)
 		output_ok = true;
 	}
 
-	// バイザー画像を出力の上に重ねて描く (親ソースのベース座標系)
+	// バイザー画像を出力の上に重ねて描く (親ソースのベース座標系)。
+	// 描画そのものは hv_draw_overlay に切り出した (ステップ16)。
+	// 診断ログ用に、実際に使った描画中心と描画幅も受け取る
 	const char *diag_branch = "not-drawn-because-image";
+	float diag_draw_cx = 0.0f, diag_draw_cy = 0.0f, diag_draw_w = 0.0f;
 	if (output_ok && filter->image.loaded && filter->image.texture) {
-		if (filter->tracking && filter->have_track &&
-		    filter->sm_dist > 0.0f) {
-			// 追従: 平滑化済みの目位置・間隔・角度で1回だけ描く。
-			// 検出が途切れても最後の変換を保持する (隠し続ける)。
-			float ang = atan2f(filter->sm_sin, filter->sm_cos);
-			// ステップ10: 追従位置・大きさの微調整
-			float dcx = filter->sm_x + (float)filter->adj_x;
-			float dcy = filter->sm_y + (float)filter->adj_y;
-			float asf = (float)filter->adj_scale / 100.0f;
-			// ステップ15: 横顔では目の間隔が潰れて幅まで潰れるため、
-			// 幅の基準は顔ボックス幅からも見積もって大きい方を使う
-			float eff_dist = filter->sm_dist;
-			float box_dist = filter->sm_box_w * HAL_BOX_DIST_RATIO;
-			if (box_dist > eff_dist)
-				eff_dist = box_dist;
-			bool drawn = false;
-			if (filter->calib_valid && filter->deform > 0) {
-				// 正面登録があれば、顔の向きで変形して描く
-				float yaw = 0.0f, pitch = 0.0f;
-				estimate_angles(filter,
-						(float)filter->deform / 100.0f,
-						&yaw, &pitch);
-				// ステップ15: 描画に使う角度だけ上限を絞る
-				// (ログの角度推定は生の推定値のまま)
-				yaw = hv_clampf(yaw, -HAL_DRAW_YAW_MAX,
-						HAL_DRAW_YAW_MAX);
-				pitch = hv_clampf(pitch, -HAL_DRAW_PITCH_MAX,
-						  HAL_DRAW_PITCH_MAX);
-				float w = (float)((double)eff_dist *
-						  filter->width_factor) *
-					  asf;
-				float h = w * (float)filter->image.cy /
-					  (float)filter->image.cx;
-				drawn = draw_visor_warped(filter, dcx, dcy, w, h,
-							  ang, yaw, pitch);
-			}
-			if (!drawn) {
-				float ts = (float)((double)eff_dist *
-						   filter->width_factor) /
-					   (float)filter->image.cx * asf;
-				draw_visor_image(filter, dcx, dcy, ts, ang);
-			}
-			diag_branch = drawn ? "tracked-warped"
-					    : "tracked-sprite";
-		} else {
-			// 従来のスライダー位置
-			float s = (float)filter->scale / 100.0f;
-			draw_visor_image(filter, (float)filter->pos_x,
-					 (float)filter->pos_y, s, 0.0f);
-			diag_branch = "slider-sprite";
-		}
+		diag_branch = hv_draw_overlay(filter, &diag_draw_cx,
+					      &diag_draw_cy, &diag_draw_w);
+	}
+
+	/* ステップ16: 出力ダンプの予約があれば、この回の実出力と
+	 * 同じ手順の複製を自前 texrender へ描いて stage へ載せる。
+	 * 書き出しは次の解析パスのマップ機会に行う (1回の指定で
+	 * 最大1回だけ) */
+	if (filter->output_dump_armed) {
+		filter->output_dump_armed = false;
+		if (output_ok && cx && cy && filter->capture &&
+		    filter->stage)
+			hv_render_output_dump(filter, effect, cx, cy);
 	}
 
 	// ステップ7: 描画状態の診断ログ (1秒に1回)
@@ -1247,12 +1382,14 @@ static void hal_visor_video_render(void *data, gs_effect_t *effect)
 		if (now - filter->last_diag_ns >= 1000000000ULL) {
 			filter->last_diag_ns = now;
 			blog(LOG_INFO,
-			     "[hal-visor] 診断: render: loaded=%d texture=%s サイズ=%ux%u have_track=%d tracking=%d 描画分岐=%s 出力分岐=%s 出力サイズ=%ux%u 描画回数/秒=%u",
+			     "[hal-visor] 診断: render: loaded=%d texture=%s サイズ=%ux%u have_track=%d tracking=%d 描画中心=(%.0f, %.0f) 描画幅=%.0f 描画分岐=%s 出力分岐=%s 出力サイズ=%ux%u 描画回数/秒=%u",
 			     filter->image.loaded ? 1 : 0,
 			     filter->image.texture ? "あり" : "なし",
 			     filter->image.cx, filter->image.cy,
 			     filter->have_track ? 1 : 0,
-			     filter->tracking ? 1 : 0, diag_branch, out_branch,
+			     filter->tracking ? 1 : 0,
+			     (double)diag_draw_cx, (double)diag_draw_cy,
+			     (double)diag_draw_w, diag_branch, out_branch,
 			     cx, cy, filter->diag_render_calls);
 			filter->diag_render_calls = 0;
 		}
