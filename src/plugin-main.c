@@ -782,60 +782,25 @@ static void hal_visor_video_render(void *data, gs_effect_t *effect)
 	uint32_t cx = target ? obs_source_get_base_width(target) : 0;
 	uint32_t cy = target ? obs_source_get_base_height(target) : 0;
 
-	bool captured = false;
-	if (cx && cy) {
-		ensure_capture(filter, cx, cy);
-		if (filter->capture) {
-			gs_texrender_reset(filter->capture);
-			if (gs_texrender_begin(filter->capture, cx, cy)) {
-				struct vec4 clear_color;
-				vec4_set(&clear_color, 0.0f, 0.0f, 0.0f, 0.0f);
-				gs_clear(GS_CLEAR_COLOR, &clear_color, 0.0f,
-					 0);
-				// 親ソースを自前 texrender へ描く
-				if (obs_source_process_filter_begin(
-					    filter->source, GS_RGBA,
-					    OBS_NO_DIRECT_RENDERING)) {
-					obs_source_process_filter_end(
-						filter->source,
-						obs_get_base_effect(
-							OBS_EFFECT_DEFAULT),
-						(int)cx, (int)cy);
-					captured = true;
-				}
-				gs_texrender_end(filter->capture);
-			}
-		}
-	}
-
-	if (captured) {
-		// キャプチャした映像をフィルターの出力として描く
-		gs_effect_t *draw_effect =
-			obs_get_base_effect(OBS_EFFECT_DEFAULT);
-		gs_eparam_t *image_param =
-			gs_effect_get_param_by_name(draw_effect, "image");
-		gs_texture_t *tex = gs_texrender_get_texture(filter->capture);
-		gs_effect_set_texture(image_param, tex);
-
-		gs_blend_state_push();
-		gs_blend_function(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA);
-		while (gs_effect_loop(draw_effect, "Draw")) {
-			gs_draw_sprite(tex, 0, cx, cy);
-		}
-		gs_blend_state_pop();
-	} else {
-		// 従来どおり: 親ソースをそのまま出力する
-		if (!obs_source_process_filter_begin(filter->source, GS_RGBA,
-						     OBS_NO_DIRECT_RENDERING))
-			return;
-		obs_source_process_filter_end(filter->source, effect, 0, 0);
-	}
-
-	// ---- ステップ3: 顔検出 (推論はワーカースレッド) ----
+	/*
+	 * ステップ9: 描画を「解析パス」と「出力パス」に分離した。
+	 * 解析パスは検出用に親ソースを自前 texrender へ描くだけで、
+	 * フィルター出力には一切描かない。出力は OBS 標準の
+	 * process_filter_begin/end で作り、出力テクスチャとそのサイズは
+	 * OBS 側に管理させる (以前はキャプチャ画像を自前で描いて出力の
+	 * 代わりにしていたため、メインプレビューの横幅縮小や、
+	 * ダイアログ表示中の揺れが起きていた)。
+	 */
 	filter->frame_count++;
 
 	// 検出器の用意はマップの外で行う (セッション生成は重い処理なので)
 	ensure_detector(filter);
+
+	// キャプチャ資源はサイズに合わせて先に用意する
+	// (サイズが変わった場合は stage_pending がリセットされるので、
+	// 古いフレームを新しいサイズで発行してしまう事故を防げる)
+	if (cx && cy)
+		ensure_capture(filter, cx, cy);
 
 	// 前回コピーしたフレームをマップしてワーカーへ渡す
 	if (filter->stage_pending && filter->stage) {
@@ -851,19 +816,54 @@ static void hal_visor_video_render(void *data, gs_effect_t *effect)
 		filter->stage_pending = false;
 	}
 
-	// 3回に1回、キャプチャを stage surface へコピーする (次回マップする)
-	if (captured && filter->stage && (filter->frame_count % 3) == 0) {
-		gs_stage_texture(filter->stage,
-				 gs_texrender_get_texture(filter->capture));
-		filter->stage_pending = true;
+	// 解析パス: 3回に1回、検出用に親ソースを自前 texrender へ描き、
+	// stage surface へコピーする (次回マップする)。出力には描かない
+	if (cx && cy && filter->capture && filter->stage &&
+	    (filter->frame_count % 3) == 0) {
+		bool staged = false;
+		gs_texrender_reset(filter->capture);
+		if (gs_texrender_begin(filter->capture, cx, cy)) {
+			struct vec4 clear_color;
+			vec4_set(&clear_color, 0.0f, 0.0f, 0.0f, 0.0f);
+			gs_clear(GS_CLEAR_COLOR, &clear_color, 0.0f, 0);
+			// 親ソースを自前 texrender へ描く
+			if (obs_source_process_filter_begin(
+				    filter->source, GS_RGBA,
+				    OBS_NO_DIRECT_RENDERING)) {
+				obs_source_process_filter_end(
+					filter->source,
+					obs_get_base_effect(OBS_EFFECT_DEFAULT),
+					(int)cx, (int)cy);
+				staged = true;
+			}
+			gs_texrender_end(filter->capture);
+		}
+		if (staged) {
+			gs_stage_texture(filter->stage,
+					 gs_texrender_get_texture(
+						 filter->capture));
+			filter->stage_pending = true;
+		}
 	}
 
 	// 最新の検出結果を取り込んで平滑化する
 	consume_results(filter);
 
-	// バイザー画像を描画
+	// 出力パス: OBS 標準の手順でフィルター出力を作る。
+	// 出力テクスチャとそのサイズは OBS 側が管理する
+	const char *out_branch = "output-begin-failed";
+	bool output_ok = false;
+	if (obs_source_process_filter_begin(filter->source, GS_RGBA,
+					    OBS_NO_DIRECT_RENDERING)) {
+		obs_source_process_filter_end(filter->source, effect, (int)cx,
+					      (int)cy);
+		out_branch = "standard-output";
+		output_ok = true;
+	}
+
+	// バイザー画像を出力の上に重ねて描く (親ソースのベース座標系)
 	const char *diag_branch = "not-drawn-because-image";
-	if (filter->image.loaded && filter->image.texture) {
+	if (output_ok && filter->image.loaded && filter->image.texture) {
 		if (filter->tracking && filter->have_track &&
 		    filter->sm_dist > 0.0f) {
 			// 追従: 平滑化済みの目位置・間隔・角度で1回だけ描く。
@@ -908,12 +908,13 @@ static void hal_visor_video_render(void *data, gs_effect_t *effect)
 		if (now - filter->last_diag_ns >= 1000000000ULL) {
 			filter->last_diag_ns = now;
 			blog(LOG_INFO,
-			     "[hal-visor] 診断: render: loaded=%d texture=%s サイズ=%ux%u have_track=%d tracking=%d 描画分岐=%s",
+			     "[hal-visor] 診断: render: loaded=%d texture=%s サイズ=%ux%u have_track=%d tracking=%d 描画分岐=%s 出力分岐=%s 出力サイズ=%ux%u",
 			     filter->image.loaded ? 1 : 0,
 			     filter->image.texture ? "あり" : "なし",
 			     filter->image.cx, filter->image.cy,
 			     filter->have_track ? 1 : 0,
-			     filter->tracking ? 1 : 0, diag_branch);
+			     filter->tracking ? 1 : 0, diag_branch, out_branch,
+			     cx, cy);
 		}
 	}
 }
