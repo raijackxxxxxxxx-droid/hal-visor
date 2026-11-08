@@ -788,13 +788,15 @@ static void hal_visor_video_render(void *data, gs_effect_t *effect)
 	// ---- ステップ3: 顔検出 (推論はワーカースレッド) ----
 	filter->frame_count++;
 
+	// 検出器の用意はマップの外で行う (セッション生成は重い処理なので)
+	ensure_detector(filter);
+
 	// 前回コピーしたフレームをマップしてワーカーへ渡す
 	if (filter->stage_pending && filter->stage) {
 		uint8_t *pixels = NULL;
 		uint32_t linesize = 0;
 		if (gs_stagesurface_map(filter->stage, &pixels, &linesize) &&
 		    pixels) {
-			ensure_detector(filter);
 			if (filter->detector)
 				publish_frame(filter, pixels, (int)cx, (int)cy,
 					      (int)linesize);
@@ -805,8 +807,8 @@ static void hal_visor_video_render(void *data, gs_effect_t *effect)
 
 	// 3回に1回、キャプチャを stage surface へコピーする (次回マップする)
 	if (captured && filter->stage && (filter->frame_count % 3) == 0) {
-		gs_copy_texture((gs_texture_t *)filter->stage,
-				gs_texrender_get_texture(filter->capture));
+		gs_stage_texture(filter->stage,
+				 gs_texrender_get_texture(filter->capture));
 		filter->stage_pending = true;
 	}
 
