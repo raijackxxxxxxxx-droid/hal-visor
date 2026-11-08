@@ -11,6 +11,8 @@
 #include <util/platform.h>
 
 #include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "face-detect.h"
@@ -101,6 +103,13 @@ struct hal_visor_data {
 	 * 診断ログ用の描画回数カウンタ (前回ログからの呼び出し回数) */
 	uint64_t last_analysis_ns;
 	uint32_t diag_render_calls;
+	/* ステップ12: フレームダンプ診断。
+	 * dump_next_frame が立っていると、次の解析パスでマップした
+	 * ステージフレームを BMP に書き出す。auto_dump_done は
+	 * 生成約2秒後の一度きりの自動ダンプ用 */
+	bool dump_next_frame;
+	bool auto_dump_done;
+	uint64_t create_ns;
 
 	/* ワーカースレッドと受け渡しスロット */
 	struct hv_frame_slot frame;
@@ -152,6 +161,197 @@ static void hv_unlock(struct hal_visor_data *filter)
 #else
 	UNUSED_PARAMETER(filter);
 #endif
+}
+
+/* ---- ステップ12: フレームダンプ診断 (BMP 書き出し) ----
+ * 解析対象フレームそのものと、モデル入力へ変換した結果を目で見るための
+ * 診断専用コード。検出・描画の挙動には一切影響しない。
+ * BMP は外部ライブラリを使わず、ヘッダを手書きで fwrite する。
+ * 書き出し先はユーザーのデスクトップ (パスは UTF-8 で保持し、
+ * Windows ではワイド文字へ変換して開く) */
+
+static void hv_put_u16le(FILE *f, uint16_t v)
+{
+	uint8_t b[2] = {(uint8_t)(v & 0xff), (uint8_t)((v >> 8) & 0xff)};
+	fwrite(b, 1, 2, f);
+}
+
+static void hv_put_u32le(FILE *f, uint32_t v)
+{
+	uint8_t b[4] = {(uint8_t)(v & 0xff), (uint8_t)((v >> 8) & 0xff),
+			(uint8_t)((v >> 16) & 0xff),
+			(uint8_t)((v >> 24) & 0xff)};
+	fwrite(b, 1, 4, f);
+}
+
+/* BITMAPFILEHEADER (14) + BITMAPINFOHEADER (40)。
+ * 高さは正の値 = ボトムアップ (最終行から書く) */
+static void hv_write_bmp_header(FILE *f, int w, int h, uint16_t bpp,
+				uint32_t image_size)
+{
+	fwrite("BM", 1, 2, f);
+	hv_put_u32le(f, 14u + 40u + image_size);
+	hv_put_u16le(f, 0);
+	hv_put_u16le(f, 0);
+	hv_put_u32le(f, 54); /* ピクセルデータのオフセット */
+	hv_put_u32le(f, 40); /* BITMAPINFOHEADER のサイズ */
+	hv_put_u32le(f, (uint32_t)w);
+	hv_put_u32le(f, (uint32_t)h);
+	hv_put_u16le(f, 1); /* planes */
+	hv_put_u16le(f, bpp);
+	hv_put_u32le(f, 0); /* BI_RGB (無圧縮) */
+	hv_put_u32le(f, image_size);
+	hv_put_u32le(f, 0); /* x 解像度 */
+	hv_put_u32le(f, 0); /* y 解像度 */
+	hv_put_u32le(f, 0); /* 使用色数 */
+	hv_put_u32le(f, 0); /* 重要色数 */
+}
+
+static FILE *hv_fopen_write(const char *utf8_path)
+{
+#ifdef _WIN32
+	wchar_t wpath[1024];
+	if (MultiByteToWideChar(CP_UTF8, 0, utf8_path, -1, wpath,
+				(int)(sizeof(wpath) / sizeof(wpath[0]))) <= 0)
+		return NULL;
+	return _wfopen(wpath, L"wb");
+#else
+	return fopen(utf8_path, "wb");
+#endif
+}
+
+/* BGRA バイト列 (行ピッチ linesize) を 32bit BMP に書く。
+ * 行の辿り方は prepare と同じ規約 (行 sy は pixels + sy * linesize) */
+static bool hv_write_bmp32_bgra(const char *path, const uint8_t *pixels,
+				int w, int h, int linesize)
+{
+	if (!path || !pixels || w <= 0 || h <= 0)
+		return false;
+	FILE *f = hv_fopen_write(path);
+	if (!f)
+		return false;
+	hv_write_bmp_header(f, w, h, 32, (uint32_t)w * (uint32_t)h * 4u);
+	for (int y = h - 1; y >= 0; y--) {
+		const uint8_t *row = pixels + (ptrdiff_t)y * linesize;
+		fwrite(row, 1, (size_t)w * 4, f);
+	}
+	bool ok = !ferror(f);
+	fclose(f);
+	return ok;
+}
+
+static uint8_t hv_float_to_byte(float v)
+{
+	if (v < 0.0f)
+		v = 0.0f;
+	if (v > 255.0f)
+		v = 255.0f;
+	return (uint8_t)(v + 0.5f);
+}
+
+/* CHW float (0..255) の R/G/B 3面を 24bit BMP に書く。
+ * BMP の格納順はピクセルごとに B,G,R、行は4バイト境界にパディング */
+static bool hv_write_bmp24_float_rgb(const char *path, const float *plane_r,
+				     const float *plane_g,
+				     const float *plane_b, int w, int h)
+{
+	if (!path || !plane_r || !plane_g || !plane_b || w <= 0 || h <= 0)
+		return false;
+	FILE *f = hv_fopen_write(path);
+	if (!f)
+		return false;
+	int row_bytes = (w * 3 + 3) & ~3;
+	uint32_t image_size = (uint32_t)row_bytes * (uint32_t)h;
+	hv_write_bmp_header(f, w, h, 24, image_size);
+	uint8_t *row = bmalloc((size_t)row_bytes);
+	for (int y = h - 1; y >= 0; y--) {
+		memset(row, 0, (size_t)row_bytes);
+		const float *rp = plane_r + (size_t)y * w;
+		const float *gp = plane_g + (size_t)y * w;
+		const float *bp = plane_b + (size_t)y * w;
+		for (int x = 0; x < w; x++) {
+			row[x * 3 + 0] = hv_float_to_byte(bp[x]);
+			row[x * 3 + 1] = hv_float_to_byte(gp[x]);
+			row[x * 3 + 2] = hv_float_to_byte(rp[x]);
+		}
+		fwrite(row, 1, (size_t)row_bytes, f);
+	}
+	bfree(row);
+	bool ok = !ferror(f);
+	fclose(f);
+	return ok;
+}
+
+/* デスクトップ上のファイルパス (UTF-8) を組み立てる */
+static void hv_desktop_file_path(char *dst, size_t dst_size,
+				 const char *filename)
+{
+#ifdef _WIN32
+	const wchar_t *home = _wgetenv(L"USERPROFILE");
+	wchar_t wname[128];
+	wchar_t wpath[1024];
+	if (!home || !home[0])
+		home = L"C:\\Users\\Public";
+	if (MultiByteToWideChar(CP_ACP, 0, filename, -1, wname,
+				(int)(sizeof(wname) / sizeof(wname[0]))) <= 0)
+		wname[0] = 0;
+	_snwprintf(wpath, sizeof(wpath) / sizeof(wpath[0]),
+		   L"%s\\Desktop\\%s", home, wname);
+	wpath[(sizeof(wpath) / sizeof(wpath[0])) - 1] = 0;
+	if (WideCharToMultiByte(CP_UTF8, 0, wpath, -1, dst, (int)dst_size,
+				NULL, NULL) <= 0)
+		snprintf(dst, dst_size, "%s", filename);
+#else
+	const char *home = getenv("USERPROFILE");
+	if (home && home[0])
+		snprintf(dst, dst_size, "%s\\Desktop\\%s", home, filename);
+	else
+		snprintf(dst, dst_size, "C:\\Users\\Public\\Desktop\\%s",
+			 filename);
+#endif
+}
+
+/*
+ * マップ済みステージフレーム (publish_frame へ渡す直前のピクセルそのもの)
+ * と、それを prepare したモデル入力をデスクトップへ BMP で書き出す。
+ */
+static void hv_dump_staged_frame(struct hal_visor_data *filter,
+				 const uint8_t *pixels, int w, int h,
+				 int linesize)
+{
+	char cap_path[1024];
+	char in_path[1024];
+	hv_desktop_file_path(cap_path, sizeof(cap_path),
+			     "hal-visor-capture.bmp");
+	hv_desktop_file_path(in_path, sizeof(in_path), "hal-visor-input.bmp");
+
+	bool cap_ok = hv_write_bmp32_bgra(cap_path, pixels, w, h, linesize);
+
+	bool in_ok = false;
+	int in_w = 0, in_h = 0;
+	if (filter->detector) {
+		float *scratch =
+			bmalloc(sizeof(float) * filter->frame_buf_cap);
+		if (scratch) {
+			if (hal_face_detector_prepare(filter->detector, pixels,
+						      w, h, linesize, scratch,
+						      filter->frame_buf_cap,
+						      &in_w, &in_h)) {
+				/* prepare の出力は BGR の CHW (面0=B, 面1=G,
+				 * 面2=R)。RGB の面として正しく渡す */
+				size_t plane = (size_t)in_w * (size_t)in_h;
+				in_ok = hv_write_bmp24_float_rgb(
+					in_path, scratch + 2 * plane,
+					scratch + plane, scratch, in_w, in_h);
+			}
+			bfree(scratch);
+		}
+	}
+
+	blog(LOG_INFO,
+	     "[hal-visor] 診断: フレームダンプ capture='%s' (%s) input='%s' (%s) ステージフレーム=%dx%d linesize=%d モデル入力=%dx%d",
+	     cap_path, cap_ok ? "OK" : "失敗", in_path,
+	     in_ok ? "OK" : "失敗", w, h, linesize, in_w, in_h);
 }
 
 /* ---- ワーカースレッド: スロットのフレームを取り出して推論し、結果を返す ---- */
@@ -427,6 +627,15 @@ static void hal_visor_video_tick(void *data, float seconds)
 	UNUSED_PARAMETER(seconds);
 	struct hal_visor_data *filter = data;
 
+	/* ステップ12: 生成から約2秒後に一度だけ自動ダンプする
+	 * (ボタンを押さなくてもダンプが残るように) */
+	if (!filter->auto_dump_done && filter->create_ns) {
+		if (os_gettime_ns() - filter->create_ns >= 2000000000ULL) {
+			filter->auto_dump_done = true;
+			filter->dump_next_frame = true;
+		}
+	}
+
 	consume_results(filter);
 }
 
@@ -527,6 +736,7 @@ static void *hal_visor_create(obs_data_t *settings, obs_source_t *source)
 {
 	struct hal_visor_data *filter = bzalloc(sizeof(struct hal_visor_data));
 	filter->source = source;
+	filter->create_ns = os_gettime_ns();
 	filter->frame_buf_cap = HAL_FACE_INPUT_MAX_FLOATS;
 	filter->frame.buf =
 		bmalloc(sizeof(float) * filter->frame_buf_cap);
@@ -851,6 +1061,15 @@ static void hal_visor_video_render(void *data, gs_effect_t *effect)
 			if (gs_stagesurface_map(filter->stage, &pixels,
 						&linesize) &&
 			    pixels) {
+				/* ステップ12: ダンプ指定があれば、
+				 * publish_frame へ渡す直前のピクセル
+				 * そのものを BMP に書き出す */
+				if (filter->dump_next_frame) {
+					filter->dump_next_frame = false;
+					hv_dump_staged_frame(filter, pixels,
+							     (int)cx, (int)cy,
+							     (int)linesize);
+				}
 				if (filter->detector)
 					publish_frame(filter, pixels, (int)cx,
 						      (int)cy,
@@ -981,6 +1200,10 @@ static bool hal_calib_clicked(obs_properties_t *props,
 	struct hal_visor_data *filter = data;
 	if (!filter)
 		return false;
+
+	/* ステップ12: 登録のタイミング (正面を向いている時) のフレームも
+	 * ダンプする。成否によらず次の解析パスで書き出す */
+	filter->dump_next_frame = true;
 
 	struct hal_face_result res;
 	memset(&res, 0, sizeof(res));
