@@ -438,6 +438,9 @@ static void hal_visor_update(void *data, obs_data_t *settings)
 		gs_image_file_free(&filter->image);
 		if (path && *path) {
 			gs_image_file_init(&filter->image, path);
+			// init はデコードのみで texture は NULL のまま。
+			// GPU テクスチャ生成には init_texture が別途必要
+			gs_image_file_init_texture(&filter->image);
 		}
 		blog(LOG_INFO,
 		     "[hal-visor] 診断: 画像読み込み結果: loaded=%d texture=%s サイズ=%ux%u",
