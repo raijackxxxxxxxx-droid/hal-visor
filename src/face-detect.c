@@ -34,7 +34,8 @@ struct hal_face_detector {
 	size_t num_outputs;
 	int fixed_in_w; /* モデル入力が固定サイズなら >0 */
 	int fixed_in_h;
-	float *input_buf; /* HAL_MAX_IN * HAL_MAX_IN * 3 */
+	float *input_buf; /* input_cap floats */
+	size_t input_cap; /* input_buf の容量 (float 数) */
 	bool logged_io;
 };
 
@@ -151,7 +152,12 @@ struct hal_face_detector *hal_face_detector_create(const char *model_path)
 		}
 	}
 
-	d->input_buf = bmalloc(sizeof(float) * HAL_MAX_IN * HAL_MAX_IN * 3);
+	/* 入力バッファはモデルの実入力サイズに合わせて確保する。
+	 * 固定サイズ入力 (例: YuNet の 640x640) は動的時の上限より大きい */
+	d->input_cap = (d->fixed_in_w > 0 && d->fixed_in_h > 0)
+			       ? (size_t)d->fixed_in_w * (size_t)d->fixed_in_h * 3
+			       : (size_t)HAL_FACE_INPUT_MAX_FLOATS;
+	d->input_buf = bmalloc(sizeof(float) * d->input_cap);
 	return d;
 
 fail:
@@ -294,10 +300,17 @@ static int find_output(struct hal_face_detector *d, const char *prefix,
 	return -1;
 }
 
+size_t hal_face_detector_input_capacity(struct hal_face_detector *det)
+{
+	if (!det)
+		return 0;
+	return det->input_cap;
+}
+
 bool hal_face_detector_prepare(struct hal_face_detector *det,
 			       const unsigned char *bgra, int src_w,
 			       int src_h, int linesize, float *dst,
-			       int *out_w, int *out_h)
+			       size_t dst_cap, int *out_w, int *out_h)
 {
 	if (!det || !bgra || !dst || src_w <= 0 || src_h <= 0)
 		return false;
@@ -312,6 +325,18 @@ bool hal_face_detector_prepare(struct hal_face_detector *det,
 	if (det->fixed_in_w > 0 && det->fixed_in_h > 0) {
 		in_w = det->fixed_in_w;
 		in_h = det->fixed_in_h;
+	}
+
+	/* 安全ガード: 必要数が書き込み先の容量を超えるなら何も書かずに中止する。
+	 * 固定サイズモデルへの差し替え等で容量不足になっても溢れさせない */
+	{
+		size_t need = (size_t)in_w * (size_t)in_h * 3;
+		if (need > dst_cap) {
+			blog(LOG_ERROR,
+			     "[hal-visor] 推論入力 (%dx%d, %zu floats) がバッファ容量 (%zu floats) を超えています。このフレームの検出を中止します",
+			     in_w, in_h, need, dst_cap);
+			return false;
+		}
 	}
 
 	/* BGRA → BGR float (0..255), 等間隔サンプリングで縮小 */
@@ -546,7 +571,8 @@ bool hal_face_detector_run(struct hal_face_detector *det,
 {
 	int in_w = 0, in_h = 0;
 	if (!hal_face_detector_prepare(det, bgra, src_w, src_h, linesize,
-				       det->input_buf, &in_w, &in_h)) {
+				       det->input_buf, det->input_cap, &in_w,
+				       &in_h)) {
 		out->found = false;
 		return false;
 	}

@@ -92,6 +92,9 @@ struct hal_visor_data {
 	struct hv_frame_slot frame;
 	struct hv_result_slot result;
 	float *worker_buf;
+	/* frame.buf と worker_buf の共通容量 (float 数)。
+	 * モデルの実入力サイズに合わせて ensure_detector で拡張される */
+	size_t frame_buf_cap;
 	bool worker_started;
 	bool worker_stop;
 #ifdef _WIN32
@@ -156,14 +159,23 @@ static DWORD WINAPI hal_worker_proc(LPVOID param)
 		} else if (filter->frame.pending) {
 			size_t n = (size_t)filter->frame.in_w *
 				   filter->frame.in_h * 3;
-			memcpy(filter->worker_buf, filter->frame.buf,
-			       n * sizeof(float));
-			in_w = filter->frame.in_w;
-			in_h = filter->frame.in_h;
-			src_w = filter->frame.src_w;
-			src_h = filter->frame.src_h;
-			det = filter->detector;
-			filter->frame.pending = false;
+			if (n > filter->frame_buf_cap) {
+				/* prepare 側のガードで通常は起こらない。
+				 * 念のための最終防御: 溢れさせるくらいなら落とす */
+				blog(LOG_ERROR,
+				     "[hal-visor] フレーム (%zu floats) がバッファ容量 (%zu floats) を超えています。破棄します",
+				     n, filter->frame_buf_cap);
+				filter->frame.pending = false;
+			} else {
+				memcpy(filter->worker_buf, filter->frame.buf,
+				       n * sizeof(float));
+				in_w = filter->frame.in_w;
+				in_h = filter->frame.in_h;
+				src_w = filter->frame.src_w;
+				src_h = filter->frame.src_h;
+				det = filter->detector;
+				filter->frame.pending = false;
+			}
 		}
 		LeaveCriticalSection(&filter->lock);
 
@@ -249,7 +261,8 @@ static void publish_frame(struct hal_visor_data *filter,
 		int in_w = 0, in_h = 0;
 		if (hal_face_detector_prepare(filter->detector, pixels, w, h,
 					      linesize, filter->frame.buf,
-					      &in_w, &in_h)) {
+					      filter->frame_buf_cap, &in_w,
+					      &in_h)) {
 			filter->frame.in_w = in_w;
 			filter->frame.in_h = in_h;
 			filter->frame.src_w = w;
@@ -263,8 +276,8 @@ static void publish_frame(struct hal_visor_data *filter,
 #else
 	int in_w = 0, in_h = 0;
 	if (hal_face_detector_prepare(filter->detector, pixels, w, h,
-				      linesize, filter->frame.buf, &in_w,
-				      &in_h)) {
+				      linesize, filter->frame.buf,
+				      filter->frame_buf_cap, &in_w, &in_h)) {
 		struct hal_face_result res;
 		memset(&res, 0, sizeof(res));
 		hal_face_detector_infer(filter->detector, filter->frame.buf,
@@ -465,10 +478,11 @@ static void *hal_visor_create(obs_data_t *settings, obs_source_t *source)
 {
 	struct hal_visor_data *filter = bzalloc(sizeof(struct hal_visor_data));
 	filter->source = source;
+	filter->frame_buf_cap = HAL_FACE_INPUT_MAX_FLOATS;
 	filter->frame.buf =
-		bmalloc(sizeof(float) * HAL_FACE_INPUT_MAX_FLOATS);
+		bmalloc(sizeof(float) * filter->frame_buf_cap);
 	filter->worker_buf =
-		bmalloc(sizeof(float) * HAL_FACE_INPUT_MAX_FLOATS);
+		bmalloc(sizeof(float) * filter->frame_buf_cap);
 
 	worker_start(filter);
 	hal_visor_update(filter, settings);
@@ -488,9 +502,25 @@ static void ensure_detector(struct hal_visor_data *filter)
 		return;
 	}
 	filter->detector = hal_face_detector_create(g_model_path);
-	if (filter->detector)
+	if (filter->detector) {
 		blog(LOG_INFO, "[hal-visor] 顔検出の準備ができました: %s",
 		     g_model_path);
+		/* フレームバッファをモデルの実入力サイズに合わせる。
+		 * 固定サイズ入力 (YuNet は 640x640) は初期確保より大きい。
+		 * ここは生成直後でまだフレームを発行していないため、
+		 * ワーカーはどちらのバッファにも触れていない */
+		size_t need = hal_face_detector_input_capacity(filter->detector);
+		if (need > filter->frame_buf_cap) {
+			filter->frame.buf = brealloc(
+				filter->frame.buf, sizeof(float) * need);
+			filter->worker_buf = brealloc(
+				filter->worker_buf, sizeof(float) * need);
+			filter->frame_buf_cap = need;
+			blog(LOG_INFO,
+			     "[hal-visor] 入力バッファを %zu floats に拡張しました",
+			     need);
+		}
+	}
 }
 
 /* キャプチャ用 texrender / stage surface をソースサイズに合わせて用意する */
