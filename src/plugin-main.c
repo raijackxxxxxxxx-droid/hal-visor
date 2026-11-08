@@ -36,6 +36,15 @@ static char *g_model_path = NULL;
 #define HAL_YAW_MAX 0.9f
 #define HAL_PITCH_MAX 0.6f
 
+/* ステップ15: 描画に使う変形角度の上限 (rad)。推定・ログは生の値のまま、
+ * 描画だけを抑えて横顔での四角形の破綻を防ぐ */
+#define HAL_DRAW_YAW_MAX 0.55f
+#define HAL_DRAW_PITCH_MAX 0.38f
+
+/* ステップ15: 幅の基準。横顔では目の間隔が潰れるため、顔ボックス幅の
+ * この割合を下限としてバイザー幅を決める */
+#define HAL_BOX_DIST_RATIO 0.42f
+
 static float hv_clampf(float v, float lo, float hi)
 {
 	return v < lo ? lo : (v > hi ? hi : v);
@@ -132,6 +141,7 @@ struct hal_visor_data {
 	float sm_x;
 	float sm_y;
 	float sm_dist;
+	float sm_box_w;
 	float sm_cos;
 	float sm_sin;
 	float sm_nose_x;
@@ -605,6 +615,7 @@ static void consume_results(struct hal_visor_data *filter)
 		filter->sm_x = res.eye_mid_x;
 		filter->sm_y = res.eye_mid_y;
 		filter->sm_dist = res.eye_dist;
+		filter->sm_box_w = res.box_w;
 		filter->sm_cos = cosf(res.eye_angle);
 		filter->sm_sin = sinf(res.eye_angle);
 		filter->sm_nose_x = res.nose_x;
@@ -614,6 +625,7 @@ static void consume_results(struct hal_visor_data *filter)
 		filter->sm_x += (res.eye_mid_x - filter->sm_x) * a;
 		filter->sm_y += (res.eye_mid_y - filter->sm_y) * a;
 		filter->sm_dist += (res.eye_dist - filter->sm_dist) * a;
+		filter->sm_box_w += (res.box_w - filter->sm_box_w) * a;
 		filter->sm_cos += (cosf(res.eye_angle) - filter->sm_cos) * a;
 		filter->sm_sin += (sinf(res.eye_angle) - filter->sm_sin) * a;
 		filter->sm_nose_x += (res.nose_x - filter->sm_nose_x) * a;
@@ -912,7 +924,7 @@ static bool ensure_quad_vb(struct hal_visor_data *filter)
 /*
  * バイザーを顔の向き (yaw/pitch) に合わせて変形して描く。
  * ローカルの隅 (±w/2, ±h/2, 0) を Y軸まわり (yaw) → X軸まわり (pitch) の
- * 順に回し、焦点距離 f = 4w の弱い透視で投影した四角形を描く。
+ * 順に回し、焦点距離 f = 8w の弱い透視で投影した四角形を描く。
  * 座標系は estimate_angles と同じ (x: 右目→左目、y: 下、z: カメラ向きが正)。
  *   yaw 回転:   x1 = x・cos(yaw),        z1 = -x・sin(yaw)
  *   pitch 回転: y2 = y・cos(pitch) + z1・sin(pitch),
@@ -949,7 +961,7 @@ static bool draw_visor_warped(struct hal_visor_data *filter, float center_x,
 	const float ly[4] = {-0.5f, -0.5f, 0.5f, 0.5f};
 	const float cyw = cosf(yaw), syw = sinf(yaw);
 	const float cpt = cosf(pitch), spt = sinf(pitch);
-	const float f = 4.0f * w;
+	const float f = 8.0f * w;
 	float px[4], py[4];
 	float min_x = 0.0f, max_x = 0.0f, min_y = 0.0f, max_y = 0.0f;
 
@@ -1185,6 +1197,12 @@ static void hal_visor_video_render(void *data, gs_effect_t *effect)
 			float dcx = filter->sm_x + (float)filter->adj_x;
 			float dcy = filter->sm_y + (float)filter->adj_y;
 			float asf = (float)filter->adj_scale / 100.0f;
+			// ステップ15: 横顔では目の間隔が潰れて幅まで潰れるため、
+			// 幅の基準は顔ボックス幅からも見積もって大きい方を使う
+			float eff_dist = filter->sm_dist;
+			float box_dist = filter->sm_box_w * HAL_BOX_DIST_RATIO;
+			if (box_dist > eff_dist)
+				eff_dist = box_dist;
 			bool drawn = false;
 			if (filter->calib_valid && filter->deform > 0) {
 				// 正面登録があれば、顔の向きで変形して描く
@@ -1192,7 +1210,13 @@ static void hal_visor_video_render(void *data, gs_effect_t *effect)
 				estimate_angles(filter,
 						(float)filter->deform / 100.0f,
 						&yaw, &pitch);
-				float w = (float)((double)filter->sm_dist *
+				// ステップ15: 描画に使う角度だけ上限を絞る
+				// (ログの角度推定は生の推定値のまま)
+				yaw = hv_clampf(yaw, -HAL_DRAW_YAW_MAX,
+						HAL_DRAW_YAW_MAX);
+				pitch = hv_clampf(pitch, -HAL_DRAW_PITCH_MAX,
+						  HAL_DRAW_PITCH_MAX);
+				float w = (float)((double)eff_dist *
 						  filter->width_factor) *
 					  asf;
 				float h = w * (float)filter->image.cy /
@@ -1201,7 +1225,7 @@ static void hal_visor_video_render(void *data, gs_effect_t *effect)
 							  ang, yaw, pitch);
 			}
 			if (!drawn) {
-				float ts = (float)((double)filter->sm_dist *
+				float ts = (float)((double)eff_dist *
 						   filter->width_factor) /
 					   (float)filter->image.cx * asf;
 				draw_visor_image(filter, dcx, dcy, ts, ang);
