@@ -2,7 +2,7 @@ name: Build for Windows
 
 on:
   push:
-    branches: [ "master", "main" ]
+    branches: [ "master", "main", "obs-32-build" ]
 
 jobs:
   build-windows:
